@@ -1,26 +1,36 @@
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from typing import List, Dict, Optional
 
 
 class MonitoringConfig(BaseSettings):
     """Конфигурация системы мониторинга"""
-    
+
     # Vercel
     VERCEL_TOKEN: Optional[str] = None
     VERCEL_PROJECT_ID: Optional[str] = None
-    
+
     # Heroku
     HEROKU_API_KEY: Optional[str] = None
     HEROKU_APP_NAMES: List[str] = []  # ["app1", "app2", "app3"]
-    
+
     # OpenAI
     OPENAI_API_KEY: Optional[str] = None
-    
+
     # Другие API ключи для проверки
     OTHER_API_KEYS: Dict[str, str] = {}  # {"service_name": "api_key"}
-    
+
     # Database
     DATABASE_URL: str = "postgresql://user:password@localhost:5432/monitoring"
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def fix_postgres_scheme(cls, v: str) -> str:
+        # Heroku выдаёт postgres://, а SQLAlchemy 2.0+ требует postgresql://
+        if v and v.startswith("postgres://"):
+            v = v.replace("postgres://", "postgresql://", 1)
+        return v
+
     REDIS_URL: str = "redis://localhost:6379/0"
     
     # Alerting
