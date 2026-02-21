@@ -1,7 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, text
 from datetime import datetime, timedelta
 from typing import List, Optional
 import asyncio
@@ -138,6 +138,37 @@ async def get_monitoring_snapshot(db: Session) -> dict:
     recent_activity = db.query(UserActivity).filter(
         UserActivity.timestamp >= yesterday
     ).all()
+
+    # Последние этапные логи генерации бизнес-планов (если таблица доступна)
+    recent_generation_logs = []
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT session_id, created_at, level, source, stage, progress, message
+                FROM synthesis_logs
+                WHERE service_name = :service_name
+                ORDER BY created_at DESC
+                LIMIT 15
+                """
+            ),
+            {"service_name": "social-plan-master"},
+        ).mappings().all()
+        recent_generation_logs = [
+            {
+                "session_id": r["session_id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "level": r["level"],
+                "source": r["source"],
+                "stage": r["stage"],
+                "progress": float(r["progress"]) if r["progress"] is not None else None,
+                "message": r["message"],
+            }
+            for r in rows
+        ]
+    except Exception:
+        # Если таблица ещё не создана — не ломаем основной мониторинг.
+        recent_generation_logs = []
     
     return {
         "timestamp": datetime.utcnow().isoformat(),
@@ -179,6 +210,7 @@ async def get_monitoring_snapshot(db: Session) -> dict:
                 "received_at": e.received_at.isoformat() if e.received_at else None
             } for e in db.query(Email).order_by(Email.received_at.desc()).limit(10)
         ],
+        "recent_generation_logs": recent_generation_logs,
         "overall_health": calculate_overall_health(services)
     }
 
@@ -255,6 +287,117 @@ async def get_all_services(db: Session = Depends(get_db)):
                 "additional_info": s.additional_info
             } for s in services
         ]
+    }
+
+
+@app.get("/api/monitoring/synthesis-logs/sessions")
+async def get_synthesis_log_sessions(
+    limit: int = 50,
+    service_name: str = "social-plan-master",
+    db: Session = Depends(get_db),
+):
+    """
+    Список последних сессий генерации с агрегированной информацией по логам.
+    """
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    session_id,
+                    MAX(created_at) AS last_log_at,
+                    MAX(progress) AS max_progress,
+                    COUNT(*) AS logs_count,
+                    MAX(CASE WHEN level = 'ERROR' THEN 1 ELSE 0 END) AS has_error
+                FROM synthesis_logs
+                WHERE service_name = :service_name
+                GROUP BY session_id
+                ORDER BY MAX(created_at) DESC
+                LIMIT :limit
+                """
+            ),
+            {"service_name": service_name, "limit": max(1, min(limit, 500))},
+        ).mappings().all()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось получить список сессий логов: {e}",
+        )
+
+    return {
+        "service_name": service_name,
+        "sessions": [
+            {
+                "session_id": r["session_id"],
+                "last_log_at": r["last_log_at"].isoformat() if r["last_log_at"] else None,
+                "max_progress": float(r["max_progress"]) if r["max_progress"] is not None else None,
+                "logs_count": int(r["logs_count"] or 0),
+                "has_error": bool(r["has_error"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/monitoring/synthesis-logs/{session_id}")
+async def get_synthesis_logs_by_session(
+    session_id: str,
+    limit: int = 300,
+    level: Optional[str] = None,
+    service_name: str = "social-plan-master",
+    db: Session = Depends(get_db),
+):
+    """
+    Детальные логи конкретной сессии генерации бизнес-плана.
+    """
+    where_level = ""
+    params = {
+        "session_id": session_id,
+        "service_name": service_name,
+        "limit": max(1, min(limit, 5000)),
+    }
+    if level:
+        where_level = " AND level = :level"
+        params["level"] = level.upper()
+
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT id, session_id, created_at, level, source, stage, progress, message, payload_json
+                FROM synthesis_logs
+                WHERE session_id = :session_id
+                  AND service_name = :service_name
+                  {where_level}
+                ORDER BY created_at ASC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось получить логи сессии: {e}",
+        )
+
+    return {
+        "session_id": session_id,
+        "service_name": service_name,
+        "count": len(rows),
+        "logs": [
+            {
+                "id": r["id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "level": r["level"],
+                "source": r["source"],
+                "stage": r["stage"],
+                "progress": float(r["progress"]) if r["progress"] is not None else None,
+                "message": r["message"],
+                "payload_json": r["payload_json"],
+            }
+            for r in rows
+        ],
     }
 
 
