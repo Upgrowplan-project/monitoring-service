@@ -166,6 +166,109 @@ class Email(Base):
         return f"<Email(id={self.id}, subject={self.subject}, from={self.from_addr})>"
 
 
+class SynthesisLog(Base):
+    """
+    Этапные логи генерации (пайплайн-логи) от сервисов.
+
+    Исторически таблица создавалась неявно через INSERT из social-plan-master.
+    Объявляем модель явно, чтобы init_db() гарантированно создавал таблицу и
+    её могли наполнять любые сервисы (social-plan-master, market-research-service).
+    """
+    __tablename__ = "synthesis_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(255), nullable=False, index=True)
+    service_name = Column(String(100), nullable=True, index=True)
+    environment = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    level = Column(String(20), nullable=True)          # INFO|WARNING|ERROR
+    source = Column(String(100), nullable=True)        # backend|deep-research-agent|...
+    stage = Column(String(255), nullable=True)
+    progress = Column(Float, nullable=True)
+    message = Column(Text, nullable=True)
+    payload_json = Column(JSON, nullable=True)
+
+    def __repr__(self):
+        return f"<SynthesisLog(session={self.session_id}, level={self.level})>"
+
+
+class ResearchReport(Base):
+    """
+    Готовые отчёты сервисов генерации (market-research-service и др.) для анализа.
+
+    Хранит вход запроса тестера + полный JSON отчёта, чтобы документы переживали
+    эфемерную ФС/TTL Redis сервиса-источника. session_id == research_id связывает
+    запись с UserRating (оценкой тестера).
+    """
+    __tablename__ = "research_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    research_id = Column(String(255), unique=True, nullable=False, index=True)
+    service_name = Column(String(100), nullable=True, index=True, default="market-research-service")
+
+    # Краткие поля запроса (для списка/фильтра без парсинга JSON)
+    product_name = Column(String(512), nullable=True)
+    country = Column(String(255), nullable=True)
+    region = Column(String(255), nullable=True)
+    business_type = Column(String(100), nullable=True)
+    product_type = Column(String(100), nullable=True)
+    industry = Column(String(255), nullable=True)
+    localization = Column(String(50), nullable=True)
+    report_language = Column(String(10), nullable=True)
+
+    status = Column(String(50), nullable=True, default="completed", index=True)
+    duration_seconds = Column(Float, nullable=True)
+
+    # Полные данные
+    request_json = Column(JSON, nullable=True)   # вход запроса тестера
+    report_json = Column(JSON, nullable=True)    # полный enhanced-отчёт
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<ResearchReport(research_id={self.research_id}, product={self.product_name})>"
+
+
+class WebEvent(Base):
+    """
+    Событие посещаемости сайта (pageview / кастомное событие) от beacon фронта.
+
+    Анонимно: visitor_id/session_id — случайные id из localStorage/sessionStorage,
+    ip хранится только как хэш. Используется для агрегатов посещаемости и воронки.
+    """
+    __tablename__ = "web_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String(50), nullable=False, default="pageview", index=True)  # pageview|event
+    event_name = Column(String(120), nullable=True)  # для кастомных событий
+
+    path = Column(String(1024), nullable=True, index=True)
+    referrer = Column(String(1024), nullable=True)
+    utm_source = Column(String(255), nullable=True, index=True)
+    utm_medium = Column(String(255), nullable=True)
+    utm_campaign = Column(String(255), nullable=True)
+
+    visitor_id = Column(String(64), nullable=True, index=True)   # анонимный, localStorage
+    session_id = Column(String(64), nullable=True, index=True)   # анонимный, sessionStorage
+
+    device_type = Column(String(20), nullable=True)   # mobile|tablet|desktop
+    browser = Column(String(50), nullable=True)
+    os = Column(String(50), nullable=True)
+    locale = Column(String(20), nullable=True)
+    timezone = Column(String(64), nullable=True)
+    country = Column(String(8), nullable=True, index=True)  # если придёт из заголовков прокси
+
+    ip_hash = Column(String(64), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    locale_url = Column(String(1024), nullable=True)  # полный URL (для отладки)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<WebEvent(type={self.event_type}, path={self.path})>"
+
+
 class EmailAttachment(Base):
     """Метаданные вложений"""
     __tablename__ = "email_attachments"

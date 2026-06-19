@@ -106,6 +106,92 @@ def check_all_services_task():
         return {"status": "error", "message": str(e)}
 
 
+@celery_app.task(name='monitoring.check_redis_memory')
+def check_redis_memory_task():
+    """
+    Проверка памяти Redis каждые 2 минуты.
+    Автоматически очищает research:* ключи если превышен cleanup_threshold.
+    """
+    import asyncio
+    from .health_checkers import HealthChecker
+
+    cfg = get_config()
+    redis_url = getattr(cfg, "MARKET_RESEARCH_REDIS_URL", None)
+
+    if not redis_url:
+        return {"status": "skipped", "reason": "MARKET_RESEARCH_REDIS_URL not configured"}
+
+    try:
+        result = asyncio.run(HealthChecker.check_redis_memory(
+            redis_url,
+            plan_limit_mb=getattr(cfg, "REDIS_PLAN_LIMIT_MB", 27.0),
+            warning_threshold=getattr(cfg, "REDIS_MEMORY_WARNING_THRESHOLD", 70.0),
+            cleanup_threshold=getattr(cfg, "REDIS_MEMORY_CLEANUP_THRESHOLD", 80.0),
+        ))
+
+        alert_manager = AlertManager()
+        meta = result.get("metadata", {})
+
+        with get_db_session() as db:
+            previous = db.query(ServiceHealth).filter(
+                ServiceHealth.service_name == "Redis: Market Research"
+            ).order_by(ServiceHealth.last_checked.desc()).first()
+            previous_status = previous.status if previous else None
+            current_status = result["status"]
+
+            health_record = ServiceHealth(
+                service_name="Redis: Market Research",
+                service_type="redis",
+                status=current_status,
+                response_time=result.get("response_time"),
+                error_message=result.get("error_message"),
+                additional_info=meta,
+                last_checked=datetime.utcnow()
+            )
+            db.add(health_record)
+
+            if alert_manager.should_send_alert("Redis: Market Research", current_status, previous_status):
+                severity = alert_manager.get_alert_severity(current_status)
+                if current_status == "healthy" and previous_status in ["degraded", "down"]:
+                    message = f"Redis memory recovered: {meta.get('used_percent', '?')}% used"
+                elif meta.get("cleanup_triggered"):
+                    message = (
+                        f"Redis auto-cleanup triggered at {meta.get('used_percent', '?')}% "
+                        f"({meta.get('used_mb', '?')}MB/{meta.get('plan_limit_mb', '?')}MB) "
+                        f"— deleted {meta.get('keys_deleted', 0)} keys"
+                    )
+                else:
+                    message = (
+                        f"Redis memory {current_status}: "
+                        f"{meta.get('used_percent', '?')}% used "
+                        f"({meta.get('used_mb', '?')}MB/{meta.get('plan_limit_mb', '?')}MB)"
+                    )
+
+                alert = SystemAlert(
+                    severity=severity,
+                    service_name="Redis: Market Research",
+                    message=message,
+                    created_at=datetime.utcnow()
+                )
+                db.add(alert)
+                db.commit()
+                asyncio.run(alert_manager.send_alert(alert))
+
+            db.commit()
+
+        logger.info(
+            f"[Redis Check] {current_status} — "
+            f"{meta.get('used_percent', '?')}% "
+            f"({meta.get('used_mb', '?')}MB/{meta.get('plan_limit_mb', '?')}MB)"
+            + (f", cleaned {meta.get('keys_deleted')} keys" if meta.get("cleanup_triggered") else "")
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in check_redis_memory_task: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 @celery_app.task(name='monitoring.collect_user_activity')
 def collect_user_activity_task():
     """
@@ -204,6 +290,13 @@ def setup_periodic_tasks(sender, **kwargs):
         300.0,  # 5 минут
         check_all_services_task.s(),
         name='check-all-services-5min'
+    )
+
+    # Проверка памяти Redis каждые 2 минуты (с авто-очисткой)
+    sender.add_periodic_task(
+        120.0,  # 2 минуты
+        check_redis_memory_task.s(),
+        name='check-redis-memory-2min'
     )
     
     # Сбор активности пользователей каждую минуту
@@ -394,6 +487,33 @@ def fetch_emails_task():
 
         M.logout()
         logger.info(f'IMAP fetch completed, fetched {fetched_count} messages')
+
+        # Уведомление о новых письмах
+        if fetched_count > 0:
+            try:
+                alert_manager = AlertManager()
+                subject = f"[Upgrowplan] {fetched_count} new email(s) at {imap_user}"
+                text = (
+                    f"You have {fetched_count} new message(s) at {imap_user}.\n\n"
+                    f"Check the monitoring dashboard for details."
+                )
+                html = f"""
+                <html><body style="font-family: Arial, sans-serif;">
+                    <div style="background:#17a2b8;color:white;padding:16px;border-radius:5px;">
+                        <h3 style="margin:0;">✉️ New Email(s) Received</h3>
+                    </div>
+                    <div style="padding:16px;background:#f8f9fa;margin-top:8px;border-radius:5px;">
+                        <p><strong>{fetched_count} new message(s)</strong> arrived at <strong>{imap_user}</strong></p>
+                        <p style="color:#6c757d;font-size:12px;margin-top:16px;">
+                            Open the monitoring dashboard to read and reply.
+                        </p>
+                    </div>
+                </body></html>
+                """
+                asyncio.run(alert_manager.send_notification_email(subject, html, text))
+            except Exception as e:
+                logger.error(f"Error sending new email notification: {e}")
+
         return {'status': 'ok', 'fetched': fetched_count}
 
     except Exception as e:

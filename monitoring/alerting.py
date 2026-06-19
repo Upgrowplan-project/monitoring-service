@@ -152,6 +152,28 @@ class AlertManager:
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
     
+    async def send_notification_email(self, subject: str, html_body: str, text_body: str):
+        """Отправка произвольного уведомления (не привязанного к системному алерту)"""
+        if not all([self.config.SMTP_HOST, self.config.SMTP_USER,
+                    self.config.SMTP_PASSWORD or self.config.MAIL_APP_PASSWORD]):
+            logger.warning("SMTP not configured, skipping notification email")
+            return
+        try:
+            password = self.config.SMTP_PASSWORD or self.config.MAIL_APP_PASSWORD
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = self.config.SMTP_USER
+            msg['To'] = self.config.ADMIN_EMAIL
+            msg.attach(MIMEText(text_body, 'plain'))
+            msg.attach(MIMEText(html_body, 'html'))
+            with smtplib.SMTP(self.config.SMTP_HOST, self.config.SMTP_PORT) as server:
+                server.starttls()
+                server.login(self.config.SMTP_USER, password)
+                server.send_message(msg)
+            logger.info(f"Notification email sent to {self.config.ADMIN_EMAIL}: {subject}")
+        except Exception as e:
+            logger.error(f"Error sending notification email: {e}")
+
     def should_send_alert(self, service_name: str, status: str, previous_status: Optional[str]) -> bool:
         """
         Определяет, нужно ли отправлять алерт

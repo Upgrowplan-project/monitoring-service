@@ -15,6 +15,9 @@ redis==5.0.1
 # HTTP клиент
 httpx==0.25.1
 
+# Auth (валидация admin-JWT от user-service)
+PyJWT==2.8.0
+
 # Конфигурация
 pydantic==2.5.0
 pydantic-settings==2.1.0

@@ -20,6 +20,31 @@ class MonitoringConfig(BaseSettings):
     # Другие API ключи для проверки
     OTHER_API_KEYS: Dict[str, str] = {}  # {"service_name": "api_key"}
 
+    # -------------------------------------------------------------------------
+    # Бэкенд-сервисы для HTTP health-проверки (пинг {url}{health_path}).
+    # JSON-список: [{"name": "Market Research", "url": "https://...", "health_path": "/health"}]
+    # health_path опционален (по умолчанию "/health").
+    # -------------------------------------------------------------------------
+    MONITORED_SERVICES: List[Dict[str, str]] = []
+
+    # API-ключи внешних сервисов.
+    # Apify — есть бесплатный эндпоинт баланса/лимитов (проверяем активно + сумма).
+    APIFY_API_TOKEN: Optional[str] = None
+    # Serper / Google CSE — активная проверка сожгла бы платную квоту, поэтому
+    # показываем только индикатор "настроен" (presence), без активных вызовов.
+    SERPER_API_KEY: Optional[str] = None
+    GOOGLE_CSE_API_KEY: Optional[str] = None
+
+    # user-service: агрегаты регистраций через токен-защищённый /api/stats/public.
+    USER_SERVICE_URL: Optional[str] = None
+    USER_SERVICE_STATS_TOKEN: Optional[str] = None
+
+    # Авторизация API: общий с user-service секрет JWT (HS512) — проверка admin-роли.
+    # Если не задан — авторизация выключена (dev). В проде обязателен.
+    JWT_SECRET: Optional[str] = None
+    # Токен для server-to-server ingest (market-research-service → /reports, /synthesis-logs).
+    MONITORING_INGEST_TOKEN: Optional[str] = None
+
     # Database
     DATABASE_URL: str = "postgresql://user:password@localhost:5432/monitoring"
 
@@ -66,6 +91,12 @@ class MonitoringConfig(BaseSettings):
     # Общий App Password (если вы используете один пароль для IMAP/SMTP)
     MAIL_APP_PASSWORD: Optional[str] = None
     
+    # Redis мониторинг (market-research-service)
+    MARKET_RESEARCH_REDIS_URL: Optional[str] = None
+    REDIS_PLAN_LIMIT_MB: float = 27.0          # лимит плана Redis Cloud в MB
+    REDIS_MEMORY_WARNING_THRESHOLD: float = 70.0   # % → degraded
+    REDIS_MEMORY_CLEANUP_THRESHOLD: float = 80.0   # % → авто-очистка research:* ключей
+
     # Пороги для алертов
     RESPONSE_TIME_WARNING_THRESHOLD: float = 2.0  # секунды
     RESPONSE_TIME_CRITICAL_THRESHOLD: float = 5.0  # секунды
@@ -73,6 +104,10 @@ class MonitoringConfig(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        # Игнорировать env-переменные, не объявленные в модели (их читают другие
+        # модули через os.getenv: ENABLE_INPROCESS_SCHEDULER, *_INTERVAL_SECONDS и т.п.).
+        # Без этого pydantic падает на "extra inputs" и роняет старт всего сервиса.
+        extra = "ignore"
 
 
 # Singleton instance

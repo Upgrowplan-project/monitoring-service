@@ -6,7 +6,7 @@ Upgrowplan Monitoring System
 
 from .config import get_config, MonitoringConfig
 from .database import get_db, get_db_session, init_db
-from .models import ServiceHealth, UserActivity, SystemAlert, APIUsageMetrics, Email, EmailAttachment
+from .models import ServiceHealth, UserActivity, SystemAlert, APIUsageMetrics, Email, EmailAttachment, SynthesisLog, ResearchReport, UserRating, RatingAnalytics, WebEvent
 from .health_checkers import HealthChecker, check_all_services
 from .alerting import AlertManager
 from .tasks import celery_app
@@ -25,6 +25,11 @@ __all__ = [
     "APIUsageMetrics",
     "Email",
     "EmailAttachment",
+    "SynthesisLog",
+    "ResearchReport",
+    "UserRating",
+    "RatingAnalytics",
+    "WebEvent",
     "HealthChecker",
     "check_all_services",
     "AlertManager",

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func, text
@@ -9,17 +9,23 @@ import logging
 import json
 
 from monitoring import (
-    get_db, 
+    get_db,
     init_db,
-    ServiceHealth, 
-    UserActivity, 
+    ServiceHealth,
+    UserActivity,
     SystemAlert,
     get_config,
     check_all_services,
     Email,
-    EmailAttachment
+    EmailAttachment,
+    SynthesisLog,
+    ResearchReport,
+    UserRating,
+    WebEvent,
 )
 from monitoring.ratings_api import router as ratings_router
+from monitoring import auth as mon_auth
+from fastapi.responses import JSONResponse
 
 # Настройка логирования
 logging.basicConfig(
@@ -41,6 +47,27 @@ app.include_router(ratings_router)
 # Получаем конфигурацию
 config = get_config()
 
+# Auth middleware: ADMIN-JWT на чтение, X-Ingest-Token на ingest, публичные —
+# открыты (см. monitoring/auth.py). Регистрируется ДО CORS, чтобы CORS остался
+# внешним слоем и проставлял заголовки даже на ответах 401/403.
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+async def _auth_dispatch(request, call_next):
+    verdict = mon_auth.check_request(
+        request.method,
+        request.url.path,
+        request.headers.get("authorization"),
+        request.headers.get("x-ingest-token"),
+    )
+    if verdict is not None:
+        code, msg = verdict
+        return JSONResponse(status_code=code, content={"detail": msg})
+    return await call_next(request)
+
+
+app.add_middleware(BaseHTTPMiddleware, dispatch=_auth_dispatch)
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -61,7 +88,24 @@ async def startup_event():
     """Инициализация при старте приложения"""
     logger.info("Initializing database...")
     init_db()
+    # Запускаем встроенный планировщик (health-проверки, Redis, IMAP-почта),
+    # т.к. в проде нет отдельных worker/beat дайно.
+    try:
+        from monitoring.scheduler import scheduler
+        scheduler.start(config)
+    except Exception as e:
+        logger.error(f"Failed to start in-process scheduler: {e}")
     logger.info("Application started successfully")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Корректная остановка планировщика."""
+    try:
+        from monitoring.scheduler import scheduler
+        await scheduler.stop()
+    except Exception as e:
+        logger.error(f"Error stopping scheduler: {e}")
 
 
 # WebSocket для real-time обновлений
@@ -94,7 +138,10 @@ manager = ConnectionManager()
 
 @app.websocket("/ws/monitoring")
 async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
-    """WebSocket endpoint для real-time обновлений"""
+    """WebSocket endpoint для real-time обновлений (требует admin-токен в ?token=)"""
+    if not mon_auth.verify_ws_token(websocket.query_params.get("token")):
+        await websocket.close(code=1008)  # policy violation
+        return
     await manager.connect(websocket)
     try:
         while True:
@@ -795,6 +842,468 @@ async def get_statistics(db: Session = Depends(get_db)):
         "monitored_services": unique_services,
         "uptime_percentage": 99.9  # Можно рассчитать на основе реальных данных
     }
+
+
+# ============================================================
+# Research Reports & Logs ingestion (market-research-service и др.)
+# ============================================================
+
+def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+@app.post("/api/monitoring/reports")
+async def ingest_research_report(payload: dict, db: Session = Depends(get_db)):
+    """
+    Приём готового отчёта от сервиса генерации (market-research-service).
+
+    Идемпотентно по research_id (upsert): повторный POST обновляет запись.
+    Тело: { research_id, service_name?, request?, report?, status?,
+            duration_seconds?, completed_at? }.
+    Краткие поля (product_name/country/...) берутся из request, если переданы.
+    """
+    research_id = payload.get("research_id") or payload.get("session_id")
+    if not research_id:
+        raise HTTPException(status_code=400, detail="research_id is required")
+
+    request_json = payload.get("request") or payload.get("request_json") or {}
+    report_json = payload.get("report") or payload.get("report_json")
+    req = request_json if isinstance(request_json, dict) else {}
+
+    def _g(*keys):
+        for k in keys:
+            v = req.get(k)
+            if v:
+                return v if isinstance(v, str) else str(v)
+        return None
+
+    try:
+        row = (
+            db.query(ResearchReport)
+            .filter(ResearchReport.research_id == research_id)
+            .first()
+        )
+        if row is None:
+            row = ResearchReport(research_id=research_id)
+            db.add(row)
+
+        row.service_name = payload.get("service_name") or "market-research-service"
+        row.product_name = _g("product_name", "productName")
+        row.country = _g("country")
+        row.region = _g("region")
+        row.business_type = _g("business_type", "businessType")
+        row.product_type = _g("product_type", "productType")
+        row.industry = _g("industry")
+        row.localization = _g("localization")
+        row.report_language = _g("report_language", "reportLanguage")
+        row.status = payload.get("status") or "completed"
+        ds = payload.get("duration_seconds")
+        row.duration_seconds = float(ds) if ds is not None else None
+        row.request_json = req or None
+        if report_json is not None:
+            row.report_json = report_json
+        row.completed_at = _parse_iso(payload.get("completed_at")) or datetime.utcnow()
+
+        db.commit()
+        db.refresh(row)
+        return {"success": True, "id": row.id, "research_id": research_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error ingesting research report {research_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/monitoring/synthesis-logs")
+async def ingest_synthesis_logs(payload: dict, db: Session = Depends(get_db)):
+    """
+    Батч-приём этапных логов пайплайна.
+
+    Тело: { service_name?, environment?, session_id?, logs: [
+        { session_id?, level?, source?, stage?, progress?, message?, payload_json?, created_at? } ] }
+    session_id/service_name можно задать на верхнем уровне как дефолт для всех строк.
+    """
+    logs = payload.get("logs")
+    if not isinstance(logs, list) or not logs:
+        raise HTTPException(status_code=400, detail="logs (non-empty list) is required")
+
+    default_service = payload.get("service_name") or "market-research-service"
+    default_session = payload.get("session_id")
+    default_env = payload.get("environment")
+
+    inserted = 0
+    try:
+        for entry in logs:
+            if not isinstance(entry, dict):
+                continue
+            session_id = entry.get("session_id") or default_session
+            if not session_id:
+                continue
+            progress = entry.get("progress")
+            db.add(
+                SynthesisLog(
+                    session_id=str(session_id),
+                    service_name=entry.get("service_name") or default_service,
+                    environment=entry.get("environment") or default_env,
+                    created_at=_parse_iso(entry.get("created_at")) or datetime.utcnow(),
+                    level=(entry.get("level") or "INFO").upper(),
+                    source=(entry.get("source") or "backend"),
+                    stage=entry.get("stage"),
+                    progress=float(progress) if progress is not None else None,
+                    message=entry.get("message"),
+                    payload_json=entry.get("payload_json"),
+                )
+            )
+            inserted += 1
+        db.commit()
+        return {"success": True, "inserted": inserted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error ingesting synthesis logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/monitoring/reports")
+async def list_research_reports(
+    service_name: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """Список сохранённых отчётов (краткие карточки) с привязкой оценки по research_id."""
+    query = db.query(ResearchReport)
+    if service_name:
+        query = query.filter(ResearchReport.service_name == service_name)
+    rows = (
+        query.order_by(ResearchReport.created_at.desc())
+        .limit(max(1, min(limit, 500)))
+        .offset(max(0, offset))
+        .all()
+    )
+
+    ids = [r.research_id for r in rows]
+    ratings = {}
+    if ids:
+        for rt in db.query(UserRating).filter(UserRating.session_id.in_(ids)).all():
+            ratings[rt.session_id] = rt.overall_rating
+
+    return {
+        "service_name": service_name,
+        "total": query.count(),
+        "reports": [
+            {
+                "research_id": r.research_id,
+                "service_name": r.service_name,
+                "product_name": r.product_name,
+                "country": r.country,
+                "region": r.region,
+                "business_type": r.business_type,
+                "product_type": r.product_type,
+                "industry": r.industry,
+                "localization": r.localization,
+                "report_language": r.report_language,
+                "status": r.status,
+                "duration_seconds": r.duration_seconds,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "rating": ratings.get(r.research_id),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/monitoring/reports/{research_id}")
+async def get_research_report(research_id: str, db: Session = Depends(get_db)):
+    """Полный отчёт + входной запрос + этапные логи + оценка тестера."""
+    row = (
+        db.query(ResearchReport)
+        .filter(ResearchReport.research_id == research_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    logs = (
+        db.query(SynthesisLog)
+        .filter(SynthesisLog.session_id == research_id)
+        .order_by(SynthesisLog.created_at.asc())
+        .limit(5000)
+        .all()
+    )
+    rating = (
+        db.query(UserRating)
+        .filter(UserRating.session_id == research_id)
+        .order_by(UserRating.created_at.desc())
+        .first()
+    )
+
+    return {
+        "research_id": row.research_id,
+        "service_name": row.service_name,
+        "product_name": row.product_name,
+        "country": row.country,
+        "region": row.region,
+        "business_type": row.business_type,
+        "product_type": row.product_type,
+        "industry": row.industry,
+        "localization": row.localization,
+        "report_language": row.report_language,
+        "status": row.status,
+        "duration_seconds": row.duration_seconds,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "request": row.request_json,
+        "report": row.report_json,
+        "logs": [
+            {
+                "created_at": l.created_at.isoformat() if l.created_at else None,
+                "level": l.level,
+                "source": l.source,
+                "stage": l.stage,
+                "progress": l.progress,
+                "message": l.message,
+            }
+            for l in logs
+        ],
+        "rating": (
+            {
+                "overall": rating.overall_rating,
+                "clarity": rating.clarity,
+                "usefulness": rating.usefulness,
+                "accuracy": rating.accuracy,
+                "design": rating.design,
+                "recommend": rating.recommend,
+                "feedback": rating.feedback,
+                "created_at": rating.created_at.isoformat() if rating.created_at else None,
+            }
+            if rating
+            else None
+        ),
+    }
+
+
+# ============================================================
+# Web analytics (posещаемость сайта) — beacon ingest + агрегаты
+# ============================================================
+
+def _hash_ip(ip: Optional[str]) -> Optional[str]:
+    if not ip:
+        return None
+    import hashlib
+    return hashlib.sha256(f"upgrowplan-salt::{ip}".encode()).hexdigest()[:32]
+
+
+def _parse_user_agent(ua: str) -> dict:
+    """Грубое определение device/browser/os без внешних зависимостей."""
+    if not ua:
+        return {"device_type": None, "browser": None, "os": None}
+    u = ua.lower()
+    if any(k in u for k in ("ipad", "tablet")):
+        device = "tablet"
+    elif any(k in u for k in ("mobi", "iphone", "android")) and "ipad" not in u:
+        device = "mobile" if "mobile" in u or "iphone" in u or "android" in u else "desktop"
+    else:
+        device = "desktop"
+    if "edg" in u:
+        browser = "Edge"
+    elif "opr" in u or "opera" in u:
+        browser = "Opera"
+    elif "chrome" in u and "chromium" not in u:
+        browser = "Chrome"
+    elif "firefox" in u:
+        browser = "Firefox"
+    elif "safari" in u:
+        browser = "Safari"
+    else:
+        browser = "Other"
+    if "windows" in u:
+        os_name = "Windows"
+    elif "android" in u:
+        os_name = "Android"
+    elif any(k in u for k in ("iphone", "ipad", "ios")):
+        os_name = "iOS"
+    elif "mac os" in u or "macintosh" in u:
+        os_name = "macOS"
+    elif "linux" in u:
+        os_name = "Linux"
+    else:
+        os_name = "Other"
+    return {"device_type": device, "browser": browser, "os": os_name}
+
+
+@app.post("/api/monitoring/pageview")
+async def ingest_pageview(payload: dict, request: Request, db: Session = Depends(get_db)):
+    """
+    Приём beacon о просмотре страницы / событии с фронта. Анонимно, без авторизации.
+    Тело: { path, referrer?, utm_source?, utm_medium?, utm_campaign?, visitor_id?,
+            session_id?, locale?, timezone?, event_type?, event_name?, url? }
+    """
+    try:
+        # IP из заголовков прокси (Heroku/Vercel/CF), берём первый.
+        fwd = request.headers.get("x-forwarded-for", "")
+        client_ip = (fwd.split(",")[0].strip() if fwd else None) or (
+            request.client.host if request.client else None
+        )
+        country = (
+            request.headers.get("x-vercel-ip-country")
+            or request.headers.get("cf-ipcountry")
+            or None
+        )
+        ua = request.headers.get("user-agent", "")
+        ua_info = _parse_user_agent(ua)
+
+        def _clip(v, n):
+            return v[:n] if isinstance(v, str) else v
+
+        row = WebEvent(
+            event_type=(payload.get("event_type") or "pageview")[:50],
+            event_name=_clip(payload.get("event_name"), 120),
+            path=_clip(payload.get("path"), 1024),
+            referrer=_clip(payload.get("referrer"), 1024),
+            utm_source=_clip(payload.get("utm_source"), 255),
+            utm_medium=_clip(payload.get("utm_medium"), 255),
+            utm_campaign=_clip(payload.get("utm_campaign"), 255),
+            visitor_id=_clip(payload.get("visitor_id"), 64),
+            session_id=_clip(payload.get("session_id"), 64),
+            device_type=ua_info["device_type"],
+            browser=ua_info["browser"],
+            os=ua_info["os"],
+            locale=_clip(payload.get("locale"), 20),
+            timezone=_clip(payload.get("timezone"), 64),
+            country=_clip(country, 8),
+            ip_hash=_hash_ip(client_ip),
+            user_agent=_clip(ua, 1000),
+            locale_url=_clip(payload.get("url"), 1024),
+        )
+        db.add(row)
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error ingesting pageview: {e}")
+        # Beacon должен быть «тихим» — не отдаём 500, чтобы не плодить ошибки в консоли клиента.
+        return {"ok": False}
+
+
+@app.get("/api/monitoring/analytics")
+async def get_analytics(days: int = 30, db: Session = Depends(get_db)):
+    """Агрегаты посещаемости сайта за период + воронка по существующим данным."""
+    days = max(1, min(days, 365))
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    base = db.query(WebEvent).filter(
+        WebEvent.created_at >= cutoff,
+        WebEvent.event_type == "pageview",
+    )
+
+    pageviews = base.count()
+    unique_visitors = (
+        db.query(func.count(func.distinct(WebEvent.visitor_id)))
+        .filter(WebEvent.created_at >= cutoff, WebEvent.event_type == "pageview")
+        .scalar()
+    ) or 0
+    sessions = (
+        db.query(func.count(func.distinct(WebEvent.session_id)))
+        .filter(WebEvent.created_at >= cutoff, WebEvent.event_type == "pageview")
+        .scalar()
+    ) or 0
+
+    def _top(column, limit=10):
+        rows = (
+            db.query(column, func.count(WebEvent.id).label("c"))
+            .filter(WebEvent.created_at >= cutoff, WebEvent.event_type == "pageview", column.isnot(None))
+            .group_by(column)
+            .order_by(func.count(WebEvent.id).desc())
+            .limit(limit)
+            .all()
+        )
+        return [{"key": r[0], "count": int(r[1])} for r in rows]
+
+    # Таймсерия по дням (через date())
+    ts_rows = (
+        db.query(
+            func.date(WebEvent.created_at).label("d"),
+            func.count(WebEvent.id).label("views"),
+            func.count(func.distinct(WebEvent.visitor_id)).label("visitors"),
+        )
+        .filter(WebEvent.created_at >= cutoff, WebEvent.event_type == "pageview")
+        .group_by(func.date(WebEvent.created_at))
+        .order_by(func.date(WebEvent.created_at))
+        .all()
+    )
+    timeseries = [
+        {"date": str(r[0]), "views": int(r[1]), "visitors": int(r[2])} for r in ts_rows
+    ]
+
+    # Источники: utm_source, иначе домен реферера, иначе "direct"
+    sources = _top(WebEvent.utm_source)
+
+    # Воронка: визиты → запущенные ресёрчи → оценки (по тем же датам)
+    researches = (
+        db.query(func.count(ResearchReport.id))
+        .filter(ResearchReport.created_at >= cutoff)
+        .scalar()
+    ) or 0
+    ratings = (
+        db.query(func.count(UserRating.id))
+        .filter(UserRating.created_at >= cutoff)
+        .scalar()
+    ) or 0
+
+    return {
+        "period_days": days,
+        "totals": {
+            "pageviews": pageviews,
+            "unique_visitors": int(unique_visitors),
+            "sessions": int(sessions),
+        },
+        "timeseries": timeseries,
+        "top_pages": _top(WebEvent.path),
+        "top_sources": sources,
+        "top_referrers": _top(WebEvent.referrer),
+        "devices": _top(WebEvent.device_type, 5),
+        "browsers": _top(WebEvent.browser, 6),
+        "countries": _top(WebEvent.country, 10),
+        "funnel": {
+            "visitors": int(unique_visitors),
+            "sessions": int(sessions),
+            "researches": int(researches),
+            "ratings": int(ratings),
+        },
+    }
+
+
+@app.get("/api/monitoring/user-stats")
+async def get_user_stats():
+    """
+    Прокси к user-service /api/stats/public (агрегаты регистраций).
+    Токен хранится на сервере мониторинга и не попадает в браузер.
+    """
+    import httpx
+    base = (config.USER_SERVICE_URL or "").rstrip("/")
+    token = config.USER_SERVICE_STATS_TOKEN
+    if not base or not token:
+        return {"configured": False}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{base}/api/stats/public",
+                headers={"X-Stats-Token": token},
+            )
+        if resp.status_code != 200:
+            return {"configured": True, "error": f"HTTP {resp.status_code}"}
+        return {"configured": True, "stats": resp.json()}
+    except Exception as e:
+        logger.error(f"Error fetching user-service stats: {e}")
+        return {"configured": True, "error": str(e)}
 
 
 if __name__ == "__main__":

@@ -205,6 +205,43 @@ POST /api/monitoring/alerts/{alert_id}/resolve
 GET /api/monitoring/stats
 ```
 
+### Оценки пользователей (ratings)
+
+```bash
+POST /api/rating                 # приём оценки от фронта (RuGrade/EnGrade)
+GET  /api/ratings/stats?service_name=&days=30
+GET  /api/ratings/export?format=csv|json
+GET  /api/ratings/services
+```
+
+### Письма (контакт-форма + IMAP)
+
+```bash
+POST /api/monitoring/contact
+GET  /api/monitoring/emails
+GET  /api/monitoring/emails/{id}
+POST /api/monitoring/emails/{id}/reply
+```
+
+### Этапные логи генерации (synthesis_logs)
+
+```bash
+GET  /api/monitoring/synthesis-logs/sessions?service_name=
+GET  /api/monitoring/synthesis-logs/{session_id}?service_name=
+POST /api/monitoring/synthesis-logs     # батч-приём логов от сервисов-источников
+```
+
+### Отчёты сервисов генерации (research_reports) — НОВОЕ
+
+Долговременное хранение готовых отчётов тестеров (market-research-service и др.),
+чтобы документы переживали TTL Redis (4ч) и эфемерную ФС Heroku.
+
+```bash
+POST /api/monitoring/reports            # идемпотентный upsert по research_id
+GET  /api/monitoring/reports?service_name=market-research-service&limit=50
+GET  /api/monitoring/reports/{research_id}   # полный отчёт + вход запроса + логи + оценка
+```
+
 ## 🔔 Настройка уведомлений
 
 ### Email (SMTP)
@@ -342,6 +379,88 @@ docker-compose logs celery_beat
 # Перезапустите Celery
 docker-compose restart celery_worker celery_beat
 ```
+
+## 📊 Web-аналитика (посещаемость)
+
+Собственный beacon → таблица `web_events` (анонимно, без cookie/PII; ip только хэшем).
+
+```bash
+POST /api/monitoring/pageview     # beacon с фронта (sendBeacon), без авторизации
+GET  /api/monitoring/analytics?days=30   # агрегаты + воронка
+```
+Агрегаты: просмотры, уник. посетители, сессии, динамика по дням, топ страниц/источников/рефереров,
+устройства, браузеры, страны (если прокси отдаёт гео-заголовок), воронка
+(посетители → сессии → запущенные ресёрчи → оценки). Фронт: компонент `AnalyticsBeacon`
+в корневом layout + вкладка «📈 Analytics».
+
+## 📌 Состояние сервиса и журнал обновлений
+
+**Деплой:** Heroku, web-дайно (`Procfile`: `web: uvicorn main:app --host 0.0.0.0 --port $PORT`).
+**URL (prod):** `https://monitoring-service-b37530bd3b04.herokuapp.com`
+**БД:** Heroku PostgreSQL. Таблицы создаются автоматически на старте (`init_db()` в `startup_event`).
+**CORS:** `https://www.upgrowplan.com`, `https://upgrowplan.com`, `http://localhost:3000`.
+**Фронт:** интегрирован в Next.js (`upgrowplan_new/app/[locale]/monitoring`), env `NEXT_PUBLIC_MONITORING_API_URL`.
+
+### Текущие подсистемы
+- ✅ Health-мониторинг сервисов (Vercel/Heroku/API) + алерты + WebSocket real-time.
+- ✅ Оценки пользователей (`user_ratings`) — вкладка «⭐ Ratings».
+- ✅ Письма (контакт-форма + IMAP, `emails`) — вкладка «✉️ Emails».
+- ✅ Этапные логи генерации (`synthesis_logs`) — пишет social-plan-master.
+- ✅ Quality Lab — вкладка «🧪 Quality Lab».
+
+### Обновление 2026-06-18 — захват отчётов/логов market-research-service
+Цель: ловить и долговременно хранить все отчёты и логи тестеров MRS для анализа.
+
+- **Новые таблицы:** `research_reports` (вход запроса + полный JSON отчёта + метаданные),
+  `synthesis_logs` теперь объявлена явной моделью (раньше создавалась неявно из social-plan-master),
+  поэтому `init_db()` гарантированно её создаёт.
+- **Новые эндпоинты:** `POST /api/monitoring/reports`, `POST /api/monitoring/synthesis-logs`,
+  `GET /api/monitoring/reports`, `GET /api/monitoring/reports/{research_id}`.
+- **Источник (market-research-service):** на завершении ресёрча шлёт отчёт + вход + логи по HTTP
+  (env `MONITORING_API_URL`). Реализация fire-and-forget — НЕ влияет на пайплайн MRS.
+- **Фронт:** новая вкладка «📄 Reports» в дашборде (список прогонов → отчёт + логи + оценка, скачивание JSON).
+- **Связь с оценками:** `research_reports.research_id == user_ratings.session_id` — отчёт и оценка тестера сшиваются.
+
+### Что нужно для активации
+- На Heroku-приложении **MRS** задать `MONITORING_API_URL=https://monitoring-service-b37530bd3b04.herokuapp.com`.
+- Перезапустить мониторинг (или вызвать `init_db()`), чтобы создались новые таблицы.
+
+### Обновление 2026-06-19 — встроенный планировщик (фоновый слой)
+**Проблема:** в проде только `web`-дайно (нет Celery worker/beat) → периодические
+задачи (health-проверки, авто-очистка Redis, **забор почты с Zoho по IMAP**) не
+выполнялись. Письма не попадали в интерфейс именно поэтому.
+
+**Решение:** `monitoring/scheduler.py` — асинхронный планировщик внутри web-процесса
+(стартует в `startup_event`). Переиспользует существующие Celery-функции, выполняя их
+в thread-executor (без вложенных event loop). Без отдельных дайно и доп. затрат.
+- health-проверки: `HEALTH_CHECK_INTERVAL_SECONDS` (по умолч. 300с)
+- Redis + авто-очистка: `REDIS_CHECK_INTERVAL_SECONDS` (120с)
+- IMAP-почта: `IMAP_POLL_INTERVAL_SECONDS` (60с)
+- очистка старых данных: `CLEANUP_INTERVAL_SECONDS` (раз в сутки)
+- выключатель: `ENABLE_INPROCESS_SCHEDULER=false` (если поднимете реальные worker/beat).
+
+**Примечания:** забираются только UNSEEN-письма (уже прочитанные ранее не подтянутся);
+вложения пишутся в `monitoring_uploads/` (эфемерно на Heroku — тело письма в БД, файлы
+вложений теряются при рестарте, durable-хранилище — отдельная задача).
+
+### Текущее состояние health-проверок (что настроено в .env)
+- ✅ PostgreSQL, ✅ Redis (market-research).
+- ⚠️ НЕ настроены (ключи отсутствуют в .env, проверки не идут): `HEROKU_API_KEY`+`HEROKU_APP_NAMES`,
+  `VERCEL_TOKEN`+`VERCEL_PROJECT_ID`, `OPENAI_API_KEY`, `OTHER_API_KEYS`. Заполнить для проверок Heroku/Vercel/OpenAI.
+
+### Обновление 2026-06-19 — расширенные health-проверки
+- **HTTP /health бэкенд-сервисов** (конфиг-driven): env `MONITORED_SERVICES` (JSON-список
+  `{name,url,health_path}`). Пингует каждый сервис, точнее чем Heroku-dyno API. Новые сервисы
+  появляются в сетке дашборда автоматически. `check_http_service` в health_checkers.py.
+- **API-проверки:**
+  - OpenAI — валидность (`/v1/models`, бесплатно).
+  - **Apify** — валидность токена + **месячный расход $/лимит** (`/v2/users/me/limits`, бесплатно).
+    Сумма выводится на карточке сервиса (прогресс-бар расхода). env `APIFY_API_TOKEN`.
+  - Serper / Google CSE — только индикатор «настроен» (env `SERPER_API_KEY`, `GOOGLE_CSE_API_KEY`),
+    БЕЗ активных вызовов, т.к. активная проверка тратит платную квоту (288 запросов/день).
+    Реальный расход этих API — собирать через собственные счётчики `api_usage_metrics`.
+- **Загрузка UI**: убран блокирующий пульсирующий спиннер — страница рендерится сразу,
+  данные подгружаются в фоне с ненавязчивым индикатором (см. upgrowplan_new MonitoringDashboard).
 
 ## 📝 Лицензия
 
