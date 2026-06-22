@@ -423,32 +423,28 @@ class HealthChecker:
         Returns:
             Dict с информацией о статусе
         """
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.pool import NullPool
+        start_time = datetime.now()
+
+        # NullPool + dispose() в finally: НЕ держим открытых коннектов между
+        # проверками (иначе при периодическом запуске роль БД упирается в лимит
+        # "too many connections" и приложение крашится при рестарте).
+        engine = create_engine(database_url, poolclass=NullPool, pool_pre_ping=True)
         try:
-            from sqlalchemy import create_engine, text
-            start_time = datetime.now()
-            
-            # Создаем временный engine
-            engine = create_engine(database_url, pool_pre_ping=True)
-            
-            # Пробуем выполнить простой запрос
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            
             response_time = (datetime.now() - start_time).total_seconds()
-            
             return {
                 "status": "healthy",
                 "response_time": response_time,
-                "metadata": {
-                    "database_type": "postgresql"
-                }
+                "metadata": {"database_type": "postgresql"},
             }
         except Exception as e:
             logger.error(f"Error checking database: {e}")
-            return {
-                "status": "down",
-                "error_message": str(e)
-            }
+            return {"status": "down", "error_message": str(e)}
+        finally:
+            engine.dispose()
 
 
     @staticmethod
