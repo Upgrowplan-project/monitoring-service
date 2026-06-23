@@ -8,10 +8,17 @@ from .models import Base
 # Получаем конфигурацию
 config = get_config()
 
-# Создаем engine
+# Создаем engine.
+# Маленький пул: Heroku essential-0 Postgres держит ~20 коннектов, а при деплое
+# старый и новый дайно на секунды пересекаются. Ограничиваем приложение ~5
+# коннектами (pool_size 3 + overflow 2), чтобы два инстанса (=10) не упирались в
+# лимит "too many connections". pool_recycle закрывает простаивающие соединения.
 engine = create_engine(
     config.DATABASE_URL,
     pool_pre_ping=True,
+    pool_size=3,
+    max_overflow=5,
+    pool_recycle=280,
     echo=False,  # Установить True для отладки SQL запросов
 )
 
