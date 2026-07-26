@@ -77,12 +77,15 @@ class InProcessScheduler:
             check_redis_memory_task,
             fetch_emails_task,
             cleanup_old_data_task,
+            visibility_scan_task,
         )
 
         health_int = float(os.getenv("HEALTH_CHECK_INTERVAL_SECONDS", "300"))
         redis_int = float(os.getenv("REDIS_CHECK_INTERVAL_SECONDS", "120"))
         email_int = float(getattr(config, "IMAP_POLL_INTERVAL_SECONDS", 60) or 60)
         cleanup_int = float(os.getenv("CLEANUP_INTERVAL_SECONDS", str(24 * 3600)))
+        # Visibility Monitor V1: 4ч ≈ 6×/день.
+        visibility_int = float(os.getenv("VISIBILITY_SCAN_INTERVAL_SECONDS", str(4 * 3600)))
 
         loop = asyncio.get_running_loop()
         # Stagger initial delays so the first ticks don't all fire at once.
@@ -99,10 +102,13 @@ class InProcessScheduler:
             loop.create_task(
                 self._run_periodic("cleanup_old_data", cleanup_int, cleanup_old_data_task, 60)
             ),
+            loop.create_task(
+                self._run_periodic("visibility_scan", visibility_int, visibility_scan_task, 30)
+            ),
         ]
         logger.info(
             f"[SCHEDULER] started: health={health_int}s, redis={redis_int}s, "
-            f"email={email_int}s, cleanup={cleanup_int}s"
+            f"email={email_int}s, cleanup={cleanup_int}s, visibility={visibility_int}s"
         )
 
     async def stop(self) -> None:

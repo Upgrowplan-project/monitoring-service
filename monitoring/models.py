@@ -269,6 +269,36 @@ class WebEvent(Base):
         return f"<WebEvent(type={self.event_type}, path={self.path})>"
 
 
+class SearchMetric(Base):
+    """
+    Visibility Monitor V1 — реальные метрики поиска (Google Search Console + Bing).
+
+    Идемпотентно: при каждом скане строки для источника ПОЛНОСТЬЮ заменяются
+    свежим окном (историю по дням отдают сами API GSC/Bing, мы не накапливаем).
+    dimension:
+      - "total" → дневной ряд (key=NULL, date=день метрики)
+      - "query" → топ-запросы за окно (key=текст запроса, date=конец окна)
+      - "page"  → топ-страницы за окно (key=URL страницы)
+    """
+    __tablename__ = "search_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source = Column(String(20), nullable=False, index=True)      # google | bing
+    date = Column(DateTime, nullable=False, index=True)          # день метрики / конец окна (UTC)
+    dimension = Column(String(20), nullable=False, index=True)   # total | query | page
+    key = Column(String(1024), nullable=True)                    # запрос/URL; NULL для total
+
+    impressions = Column(Integer, default=0)
+    clicks = Column(Integer, default=0)
+    ctr = Column(Float, default=0.0)
+    position = Column(Float, nullable=True)
+
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<SearchMetric(source={self.source}, dim={self.dimension}, date={self.date})>"
+
+
 class EmailAttachment(Base):
     """Метаданные вложений"""
     __tablename__ = "email_attachments"

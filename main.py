@@ -295,11 +295,98 @@ async def root():
 async def get_overview(db: Session = Depends(get_db)):
     """
     Получение общего обзора состояния системы
-    
+
     Returns:
         Dict с информацией о всех сервисах, алертах и активности
     """
     return await get_monitoring_snapshot(db)
+
+
+# ── Visibility Monitor V1 (реальные метрики поиска: GSC + Bing) ───────────────
+# Под /api/monitoring/* → авто-защита admin-JWT существующим middleware.
+
+@app.get("/api/monitoring/visibility/timeseries")
+async def visibility_timeseries(days: int = 30, db: Session = Depends(get_db)):
+    """Дневной ряд impressions/clicks/CTR/позиции по источникам (google, bing)."""
+    from monitoring.models import SearchMetric
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    rows = (
+        db.query(SearchMetric)
+        .filter(SearchMetric.dimension == "total", SearchMetric.date >= cutoff)
+        .order_by(SearchMetric.date.asc())
+        .all()
+    )
+    out: dict = {"google": [], "bing": []}
+    for r in rows:
+        out.setdefault(r.source, []).append({
+            "date": r.date.date().isoformat(),
+            "impressions": r.impressions,
+            "clicks": r.clicks,
+            "ctr": r.ctr,
+            "position": r.position,
+        })
+    return out
+
+
+@app.get("/api/monitoring/visibility/top")
+async def visibility_top(
+    source: str = "google", dimension: str = "query", limit: int = 25,
+    db: Session = Depends(get_db),
+):
+    """Топ запросов/страниц источника по показам."""
+    from monitoring.models import SearchMetric
+
+    rows = (
+        db.query(SearchMetric)
+        .filter(SearchMetric.source == source, SearchMetric.dimension == dimension)
+        .order_by(SearchMetric.impressions.desc())
+        .limit(min(limit, 200))
+        .all()
+    )
+    return [
+        {"key": r.key, "impressions": r.impressions, "clicks": r.clicks,
+         "ctr": r.ctr, "position": r.position}
+        for r in rows
+    ]
+
+
+@app.get("/api/monitoring/visibility/summary")
+async def visibility_summary(db: Session = Depends(get_db)):
+    """Сводка по источникам: суммарные показы/клики/CTR окна + свежесть данных."""
+    from monitoring.models import SearchMetric
+
+    out: dict = {}
+    for source in ("google", "bing"):
+        agg = (
+            db.query(
+                func.coalesce(func.sum(SearchMetric.impressions), 0),
+                func.coalesce(func.sum(SearchMetric.clicks), 0),
+                func.max(SearchMetric.fetched_at),
+            )
+            .filter(SearchMetric.source == source, SearchMetric.dimension == "total")
+            .first()
+        )
+        impressions = int(agg[0] or 0)
+        clicks = int(agg[1] or 0)
+        out[source] = {
+            "impressions": impressions,
+            "clicks": clicks,
+            "ctr": (clicks / impressions) if impressions else 0.0,
+            "last_fetched": agg[2].isoformat() if agg[2] else None,
+        }
+    return out
+
+
+@app.post("/api/monitoring/visibility/scan")
+async def visibility_scan_now():
+    """Запустить скан немедленно (для кнопки 'Scan now' во вкладке)."""
+    import asyncio
+    from monitoring.tasks import visibility_scan_task
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, visibility_scan_task)
+    return {"status": "ok", "result": result}
 
 
 @app.get("/api/monitoring/services")

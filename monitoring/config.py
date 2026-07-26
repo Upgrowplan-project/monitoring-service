@@ -100,6 +100,29 @@ class MonitoringConfig(BaseSettings):
     # Пороги для алертов
     RESPONSE_TIME_WARNING_THRESHOLD: float = 2.0  # секунды
     RESPONSE_TIME_CRITICAL_THRESHOLD: float = 5.0  # секунды
+
+    # -------------------------------------------------------------------------
+    # Visibility Monitor V1 — реальные метрики поиска (GSC + Bing Webmaster).
+    # Без ключей задачи просто пропускаются (graceful skip). Интервал скана
+    # читается из env VISIBILITY_SCAN_INTERVAL_SECONDS (по умолчанию 4ч ≈ 6×/день).
+    # -------------------------------------------------------------------------
+    VISIBILITY_SITE_URL: str = "https://www.upgrowplan.com/"
+    VISIBILITY_LOOKBACK_DAYS: int = 30
+
+    # Google Search Console. Два способа (приоритет у service-account):
+    #  1) Service-account: GSC_SERVICE_ACCOUNT_JSON (инлайн-JSON для прода/Heroku)
+    #     или GSC_SERVICE_ACCOUNT_FILE (путь к .json для локали). Email SA должен
+    #     быть добавлен пользователем в свойство GSC.
+    #  2) OAuth refresh-token: GSC_CLIENT_ID/SECRET/REFRESH_TOKEN.
+    GSC_SERVICE_ACCOUNT_JSON: Optional[str] = None
+    GSC_SERVICE_ACCOUNT_FILE: Optional[str] = None
+    GSC_CLIENT_ID: Optional[str] = None
+    GSC_CLIENT_SECRET: Optional[str] = None
+    GSC_REFRESH_TOKEN: Optional[str] = None
+
+    # Bing Webmaster Tools (apikey из кабинета)
+    BING_WEBMASTER_API_KEY: Optional[str] = None
+    BING_SITE_URL: Optional[str] = None  # по умолчанию = VISIBILITY_SITE_URL
     
     class Config:
         env_file = ".env"

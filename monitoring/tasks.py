@@ -519,3 +519,103 @@ def fetch_emails_task():
     except Exception as e:
         logger.error(f'Error in fetch_emails_task: {e}')
         return {'status': 'error', 'message': str(e)}
+
+
+def _to_dt(day_str):
+    """'YYYY-MM-DD' → datetime (UTC 00:00). None-safe."""
+    if not day_str:
+        return None
+    try:
+        return datetime.strptime(str(day_str)[:10], "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+@celery_app.task(name='monitoring.visibility_scan')
+def visibility_scan_task():
+    """
+    Visibility Monitor V1 — тянет РЕАЛЬНЫЕ метрики поиска (GSC + Bing) и
+    идемпотентно заменяет снимок по каждому источнику в search_metrics.
+    Без ключей источник просто пропускается (graceful skip).
+    Вызывается in-process планировщиком ~6×/день.
+    """
+    from .database import get_db_session
+    from .models import SearchMetric
+    from .visibility import gsc_client
+    from .visibility.bing_client import fetch as bing_fetch
+
+    cfg = get_config()
+    site = getattr(cfg, "VISIBILITY_SITE_URL", None)
+    days = int(getattr(cfg, "VISIBILITY_LOOKBACK_DAYS", 30) or 30)
+
+    def persist(source: str, data: dict) -> int:
+        if not data:
+            return 0
+        now = datetime.utcnow()
+        end_dt = _to_dt((data.get("range") or {}).get("end")) or now
+        rows = []
+        for d in data.get("by_date", []) or []:
+            dd = _to_dt(d.get("date"))
+            if dd is None:
+                continue
+            rows.append(SearchMetric(
+                source=source, date=dd, dimension="total", key=None,
+                impressions=d.get("impressions", 0), clicks=d.get("clicks", 0),
+                ctr=d.get("ctr", 0.0), position=d.get("position"), fetched_at=now,
+            ))
+        for dim, items in (("query", data.get("top_queries")), ("page", data.get("top_pages"))):
+            for d in (items or [])[:200]:
+                if not d.get("key"):
+                    continue
+                rows.append(SearchMetric(
+                    source=source, date=end_dt, dimension=dim, key=str(d["key"])[:1024],
+                    impressions=d.get("impressions", 0), clicks=d.get("clicks", 0),
+                    ctr=d.get("ctr", 0.0), position=d.get("position"), fetched_at=now,
+                ))
+        if not rows:
+            return 0
+        with get_db_session() as db:
+            # Идемпотентно: заменяем прошлый снимок источника (история приходит от API).
+            db.query(SearchMetric).filter(SearchMetric.source == source).delete()
+            db.add_all(rows)
+            db.commit()
+        return len(rows)
+
+    results = {}
+    try:
+        # Приоритет — service-account; фолбэк — OAuth refresh-token.
+        sa = gsc_client.load_service_account(
+            getattr(cfg, "GSC_SERVICE_ACCOUNT_JSON", None),
+            getattr(cfg, "GSC_SERVICE_ACCOUNT_FILE", None),
+        )
+        if sa:
+            gsc = gsc_client.fetch_sa(site, sa, days=days)
+        else:
+            gsc = gsc_client.fetch(
+                site,
+                getattr(cfg, "GSC_CLIENT_ID", None),
+                getattr(cfg, "GSC_CLIENT_SECRET", None),
+                getattr(cfg, "GSC_REFRESH_TOKEN", None),
+                days=days,
+            )
+        results["google"] = persist("google", gsc)
+    except Exception as e:
+        logger.error(f"[Visibility] GSC scan failed: {e}")
+        results["google"] = "error"
+
+    try:
+        bing = bing_fetch(
+            getattr(cfg, "BING_SITE_URL", None) or site,
+            getattr(cfg, "BING_WEBMASTER_API_KEY", None),
+            days=days,
+        )
+        results["bing"] = persist("bing", bing)
+    except Exception as e:
+        logger.error(f"[Visibility] Bing scan failed: {e}")
+        results["bing"] = "error"
+
+    if not any(isinstance(v, int) and v > 0 for v in results.values()):
+        logger.info(f"[Visibility] scan produced no rows (keys configured?) results={results}")
+    else:
+        logger.info(f"[Visibility] scan done: {results}")
+    return {"status": "ok", "persisted": results}

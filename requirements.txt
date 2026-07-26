@@ -18,6 +18,9 @@ httpx==0.25.1
 # Auth (валидация admin-JWT от user-service)
 PyJWT==2.8.0
 
+# Подпись RS256-JWT для service-account Google Search Console (Visibility Monitor)
+cryptography>=41.0.0
+
 # Конфигурация
 pydantic==2.5.0
 pydantic-settings==2.1.0
