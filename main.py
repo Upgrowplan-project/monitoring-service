@@ -731,6 +731,7 @@ async def list_emails(limit: int = 50, offset: int = 0, db: Session = Depends(ge
             'to': r.to_addr,
             'status': r.status,
             'direction': r.direction,
+            'source': r.source,
             'received_at': r.received_at.isoformat() if r.received_at else None,
             'created_at': r.created_at.isoformat()
         })
