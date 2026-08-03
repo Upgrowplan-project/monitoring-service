@@ -4,7 +4,7 @@ from datetime import datetime
 import logging
 from .config import get_config
 from .database import get_db_session
-from .models import ServiceHealth, SystemAlert, UserActivity
+from .models import ServiceHealth, SystemAlert, UserActivity, GeoCheck
 from .health_checkers import check_all_services
 from .alerting import AlertManager
 
@@ -619,3 +619,78 @@ def visibility_scan_task():
     else:
         logger.info(f"[Visibility] scan done: {results}")
     return {"status": "ok", "persisted": results}
+
+
+# ---------------------------------------------------------------------------
+# GEO Visibility — проверка упоминаний бренда в ответах нейросетей
+# ---------------------------------------------------------------------------
+
+GEO_QUERIES = [
+    "What are the best AI tools for creating business plans in 2026?",
+    "Which platforms help entrepreneurs with market research?",
+    "Best AI business plan generator for small business owners",
+    "AI-powered tools for financial modeling and analysis for startups",
+    "Top tools for business planning and market research online",
+]
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+
+def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
+    lower = text.lower()
+    idx = lower.find(brand.lower())
+    if idx == -1:
+        return {"mentioned": False, "position": None, "excerpt": None}
+    n = len(lower)
+    if idx < n * 0.33:
+        pos = "early"
+    elif idx < n * 0.66:
+        pos = "middle"
+    else:
+        pos = "late"
+    s = max(0, idx - 120)
+    e = min(len(text), idx + 300)
+    return {"mentioned": True, "position": pos, "excerpt": text[s:e]}
+
+
+def geo_visibility_task():
+    import httpx
+    import time
+
+    cfg = get_config()
+    api_key = getattr(cfg, "GEMINI_API_KEY", None)
+    brand = getattr(cfg, "GEO_BRAND", "upgrowplan")
+    if not api_key:
+        logger.info("[GEO] GEMINI_API_KEY not set, skipping geo_visibility_task")
+        return
+
+    url = f"{GEMINI_URL}?key={api_key}"
+    rows = []
+    for query in GEO_QUERIES:
+        try:
+            r = httpx.post(url, json={
+                "contents": [{"parts": [{"text": query}]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
+            }, timeout=30)
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            m = _extract_mention(text, brand)
+            rows.append(GeoCheck(
+                llm="gemini",
+                query=query,
+                response_text=text[:3000],
+                mentioned=m["mentioned"],
+                position=m["position"],
+                excerpt=m["excerpt"],
+                auto=True,
+            ))
+            time.sleep(2)
+        except Exception as e:
+            logger.error(f"[GEO] Gemini query failed for '{query[:40]}': {e}")
+
+    if rows:
+        with get_db_session() as db:
+            db.add_all(rows)
+            db.commit()
+        mentions = sum(1 for r in rows if r.mentioned)
+        logger.info(f"[GEO] scan done: {len(rows)} queries, {mentions}/{len(rows)} mentions of '{brand}'")

@@ -123,6 +123,11 @@ class MonitoringConfig(BaseSettings):
     # Bing Webmaster Tools (apikey из кабинета)
     BING_WEBMASTER_API_KEY: Optional[str] = None
     BING_SITE_URL: Optional[str] = None  # по умолчанию = VISIBILITY_SITE_URL
+
+    # GEO Visibility — проверка упоминаний бренда в ответах нейросетей
+    GEMINI_API_KEY: Optional[str] = None
+    GEO_BRAND: str = "upgrowplan"
+    GEO_SCAN_INTERVAL_SECONDS: int = 48 * 3600  # раз в 2 дня
     
     class Config:
         env_file = ".env"

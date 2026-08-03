@@ -23,6 +23,7 @@ from monitoring import (
     UserRating,
     WebEvent,
 )
+from monitoring.models import GeoCheck
 from monitoring.ratings_api import router as ratings_router
 from monitoring import auth as mon_auth
 from fastapi.responses import JSONResponse
@@ -387,6 +388,74 @@ async def visibility_scan_now():
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, visibility_scan_task)
     return {"status": "ok", "result": result}
+
+
+@app.get("/api/monitoring/geo")
+async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
+    """GEO Visibility: последние результаты проверки упоминаний бренда в нейросетях."""
+    rows = (
+        db.query(GeoCheck)
+        .order_by(GeoCheck.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    items = [
+        {
+            "id": r.id,
+            "llm": r.llm,
+            "query": r.query,
+            "mentioned": r.mentioned,
+            "position": r.position,
+            "excerpt": r.excerpt,
+            "auto": r.auto,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
+    # Сводка по LLM
+    from collections import defaultdict
+    summary: dict = defaultdict(lambda: {"total": 0, "mentioned": 0, "last_check": None})
+    for r in rows:
+        s = summary[r.llm]
+        s["total"] += 1
+        if r.mentioned:
+            s["mentioned"] += 1
+        if s["last_check"] is None or r.created_at.isoformat() > s["last_check"]:
+            s["last_check"] = r.created_at.isoformat()
+    return {"items": items, "summary": dict(summary)}
+
+
+@app.post("/api/monitoring/geo/scan")
+async def geo_scan_now():
+    """Запустить GEO-скан через Gemini немедленно."""
+    import asyncio
+    from monitoring.tasks import geo_visibility_task
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, geo_visibility_task)
+    return {"status": "ok"}
+
+
+@app.post("/api/monitoring/geo/manual")
+async def geo_manual(body: dict, db: Session = Depends(get_db)):
+    """Сохранить результат ручной проверки (вставить ответ из ChatGPT / Perplexity / etc)."""
+    cfg = get_config()
+    brand = getattr(cfg, "GEO_BRAND", "upgrowplan")
+    from monitoring.tasks import _extract_mention
+    text = body.get("response_text", "")
+    m = _extract_mention(text, brand)
+    row = GeoCheck(
+        llm=body.get("llm", "manual"),
+        query=body.get("query", ""),
+        response_text=text[:3000],
+        mentioned=m["mentioned"],
+        position=m["position"],
+        excerpt=m["excerpt"],
+        auto=False,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "mentioned": row.mentioned, "position": row.position, "excerpt": row.excerpt}
 
 
 @app.get("/api/monitoring/services")

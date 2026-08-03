@@ -299,6 +299,24 @@ class SearchMetric(Base):
         return f"<SearchMetric(source={self.source}, dim={self.dimension}, date={self.date})>"
 
 
+class GeoCheck(Base):
+    """Результат проверки видимости бренда в ответах нейросетей (GEO Visibility)."""
+    __tablename__ = "geo_checks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    llm = Column(String(50), nullable=False, index=True)   # gemini|chatgpt|perplexity|manual
+    query = Column(Text, nullable=False)
+    response_text = Column(Text, nullable=True)
+    mentioned = Column(Boolean, nullable=False, default=False)
+    position = Column(String(20), nullable=True)           # early|middle|late
+    excerpt = Column(Text, nullable=True)
+    auto = Column(Boolean, default=True, nullable=False)   # True=автоматически, False=вручную
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<GeoCheck(llm={self.llm}, mentioned={self.mentioned}, created_at={self.created_at})>"
+
+
 class EmailAttachment(Base):
     """Метаданные вложений"""
     __tablename__ = "email_attachments"
