@@ -60,6 +60,7 @@ class MonitoringConfig(BaseSettings):
     
     # Alerting
     ADMIN_EMAIL: Optional[str] = None
+    SMTP_FROM_EMAIL: Optional[str] = None  # отображаемый From-адрес (info@upgrowplan.com)
     
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None

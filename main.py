@@ -730,8 +730,9 @@ async def post_contact(payload: dict, db: Session = Depends(get_db)):
         msg = EmailMessage()
         subject = f"Website contact: {name or email_addr}"
         msg['Subject'] = subject
-        msg['From'] = cfg.SMTP_USER or email_addr
-        msg['To'] = cfg.ADMIN_EMAIL or (cfg.SMTP_USER or 'info@upgrowplan.com')
+        from_addr = getattr(cfg, 'SMTP_FROM_EMAIL', None) or cfg.SMTP_USER or 'info@upgrowplan.com'
+        msg['From'] = from_addr
+        msg['To'] = cfg.ADMIN_EMAIL or cfg.SMTP_USER or 'info@upgrowplan.com'
         msg['Reply-To'] = email_addr
         msg.set_content(f"From: {name or ''} <{email_addr}>\n\n{message_text}")
 
