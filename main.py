@@ -713,7 +713,7 @@ async def resolve_alert(
 
 @app.post('/api/monitoring/contact')
 async def post_contact(payload: dict, db: Session = Depends(get_db)):
-    """Приём сообщений с контактной формы: отправка на SMTP и сохранение в БД"""
+    """Приём сообщений с контактной формы: отправка через Brevo API и сохранение в БД"""
     try:
         name = payload.get('name')
         email_addr = payload.get('email')
@@ -723,62 +723,54 @@ async def post_contact(payload: dict, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail='Missing required fields')
 
         cfg = get_config()
-        # Формируем EmailMessage
-        from email.message import EmailMessage
-        import smtplib
-
-        msg = EmailMessage()
         subject = f"Website contact: {name or email_addr}"
-        msg['Subject'] = subject
-        from_addr = getattr(cfg, 'SMTP_FROM_EMAIL', None) or cfg.SMTP_USER or 'info@upgrowplan.com'
-        msg['From'] = from_addr
-        msg['To'] = cfg.ADMIN_EMAIL or cfg.SMTP_USER or 'info@upgrowplan.com'
-        msg['Reply-To'] = email_addr
-        msg.set_content(f"From: {name or ''} <{email_addr}>\n\n{message_text}")
+        from_email = getattr(cfg, 'SMTP_FROM_EMAIL', None) or 'info@upgrowplan.com'
+        to_email = cfg.ADMIN_EMAIL or 'naletovd@gmail.com'
+        body_text = f"From: {name or ''} <{email_addr}>\n\n{message_text}"
 
-        # Отправляем через SMTP (опциональна для разработки)
-        smtp_password = cfg.SMTP_PASSWORD or cfg.MAIL_APP_PASSWORD
-        logger.info(f"SMTP Config: host={cfg.SMTP_HOST}, port={cfg.SMTP_PORT}, user={cfg.SMTP_USER}, has_password={bool(smtp_password)}")
-        
-        if cfg.SMTP_HOST and cfg.SMTP_USER and smtp_password:
-            # Пытаемся отправить
-            smtp_port = cfg.SMTP_PORT or 587
+        # Отправка через Brevo HTTP API (работает на Heroku, не требует SMTP-порта)
+        brevo_key = (cfg.SMTP_PASSWORD or cfg.MAIL_APP_PASSWORD or '').strip()
+        sent = False
+        if brevo_key:
             try:
-                if smtp_port == 465:
-                    server = smtplib.SMTP_SSL(cfg.SMTP_HOST, smtp_port)
-                else:
-                    server = smtplib.SMTP(cfg.SMTP_HOST, smtp_port)
-                    server.starttls()
-                
-                logger.info(f"Attempting SMTP login with user={cfg.SMTP_USER}, password_len={len(smtp_password)}")
-                server.login(cfg.SMTP_USER, smtp_password)
-                logger.info("SMTP login successful")
-                server.send_message(msg)
-                server.quit()
-                logger.info("Email sent via SMTP successfully")
-            except Exception as smtp_err:
-                logger.warning(f"SMTP send failed (may be free tier limitation): {smtp_err}. Email will be saved to database only.")
+                import httpx as _httpx
+                resp = _httpx.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    headers={"api-key": brevo_key, "Content-Type": "application/json"},
+                    json={
+                        "sender": {"name": "Upgrowplan", "email": from_email},
+                        "to": [{"email": to_email}],
+                        "replyTo": {"email": email_addr},
+                        "subject": subject,
+                        "textContent": body_text,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                sent = True
+                logger.info(f"Email sent via Brevo API to {to_email}")
+            except Exception as e:
+                logger.warning(f"Brevo API send failed: {e}. Email saved to DB only.")
         else:
-            logger.info("SMTP not configured - email will be saved to database only")
+            logger.info("Brevo API key not configured — email saved to DB only")
 
-
-        # Сохраняем исходящее письмо в БД
+        # Сохраняем в БД
         email_row = Email(
             message_id=None,
             direction='outbound',
             source='contact_form',
             subject=subject,
-            from_addr=msg['From'],
-            to_addr=msg['To'],
-            body_text=msg.get_content(),
+            from_addr=from_email,
+            to_addr=to_email,
+            body_text=body_text,
             sent_at=datetime.utcnow(),
-            status='sent',
+            status='sent' if sent else 'db_only',
             metadata_json={'reply_to': email_addr}
         )
         db.add(email_row)
         db.commit()
 
-        return { 'message': 'sent' }
+        return {'message': 'sent'}
 
     except HTTPException:
         raise

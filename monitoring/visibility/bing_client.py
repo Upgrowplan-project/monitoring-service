@@ -58,6 +58,7 @@ def fetch(site_url: Optional[str], apikey: Optional[str], days: int = 30) -> dic
     """Возвращает {by_date, top_queries, top_pages} или {} если не настроено."""
     if not (site_url and apikey):
         return {}
+    apikey = apikey.strip()  # env vars sometimes have trailing newline
 
     cutoff = dt.date.today() - dt.timedelta(days=days)
 
