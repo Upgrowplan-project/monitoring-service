@@ -61,6 +61,7 @@ class MonitoringConfig(BaseSettings):
     # Alerting
     ADMIN_EMAIL: Optional[str] = None
     SMTP_FROM_EMAIL: Optional[str] = None  # отображаемый From-адрес (info@upgrowplan.com)
+    BREVO_API_KEY: Optional[str] = None    # REST API key (xkeysib-...), отдельно от SMTP key
     
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None

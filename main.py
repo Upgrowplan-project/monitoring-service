@@ -729,7 +729,7 @@ async def post_contact(payload: dict, db: Session = Depends(get_db)):
         body_text = f"From: {name or ''} <{email_addr}>\n\n{message_text}"
 
         # Отправка через Brevo HTTP API (работает на Heroku, не требует SMTP-порта)
-        brevo_key = (cfg.SMTP_PASSWORD or cfg.MAIL_APP_PASSWORD or '').strip()
+        brevo_key = (getattr(cfg, 'BREVO_API_KEY', None) or '').strip()
         sent = False
         if brevo_key:
             try:
