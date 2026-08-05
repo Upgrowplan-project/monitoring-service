@@ -87,8 +87,8 @@ class InProcessScheduler:
         cleanup_int = float(os.getenv("CLEANUP_INTERVAL_SECONDS", str(24 * 3600)))
         # Visibility Monitor V1: 4ч ≈ 6×/день.
         visibility_int = float(os.getenv("VISIBILITY_SCAN_INTERVAL_SECONDS", str(4 * 3600)))
-        # GEO Visibility: раз в 2 дня (Gemini free tier).
-        geo_int = float(os.getenv("GEO_SCAN_INTERVAL_SECONDS", str(48 * 3600)))
+        # GEO Visibility: раз в день (Gemini free tier 1500 req/day).
+        geo_int = float(os.getenv("GEO_SCAN_INTERVAL_SECONDS", str(24 * 3600)))
 
         loop = asyncio.get_running_loop()
         # Stagger initial delays so the first ticks don't all fire at once.

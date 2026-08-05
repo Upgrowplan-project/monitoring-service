@@ -427,12 +427,13 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.post("/api/monitoring/geo/scan")
 async def geo_scan_now():
-    """Запустить GEO-скан через Gemini немедленно."""
-    import asyncio
+    """Запустить GEO-скан через Gemini немедленно. Возвращает результат и ошибки."""
     from monitoring.tasks import geo_visibility_task
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, geo_visibility_task)
-    return {"status": "ok"}
+    result = await loop.run_in_executor(None, geo_visibility_task)
+    if isinstance(result, dict) and result.get("status") == "skipped":
+        return JSONResponse({"status": "skipped", "reason": result.get("reason", "API key not configured")})
+    return {"status": "ok", "result": result or {}}
 
 
 @app.post("/api/monitoring/geo/manual")
