@@ -679,6 +679,7 @@ def geo_visibility_task():
     if not api_key:
         logger.info("[GEO] GEMINI_API_KEY not set, skipping geo_visibility_task")
         return {"status": "skipped", "reason": "GEMINI_API_KEY not configured"}
+    api_key = api_key.strip()  # Heroku env vars may have trailing newline
 
     # Ротация по дням: группа 0→1→2→0…
     day_group = dt.date.today().toordinal() % 3
