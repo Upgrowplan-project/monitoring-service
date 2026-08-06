@@ -625,29 +625,35 @@ def visibility_scan_task():
 # GEO Visibility — проверка упоминаний бренда в ответах нейросетей
 # ---------------------------------------------------------------------------
 
-# 15 запросов, разбиты на 3 группы по 5 — ротация каждый день
+# ---------------------------------------------------------------------------
+# GEO queries: 18 запросов = 3 группы × 6, ротация каждый день.
+# Группа 0: прямые брендовые (RU+EN)
+# Группа 1: бизнес-план / стартапы (EN)
+# Группа 2: маркетинг / финмодель (EN)
+# ---------------------------------------------------------------------------
 GEO_QUERIES_ALL = [
-    # Группа 0: бизнес-план генерация
-    "What are the best AI tools for creating business plans in 2026?",
+    # Группа 0: прямые брендовые + общие категорийные
+    "Что такое Upgrowplan и для чего он нужен?",
+    "Для чего предназначен сайт upgrowplan.com?",
+    "Какие ИИ-сервисы помогают составить бизнес-план для стартапа?",
+    "Посоветуй лучшие ИИ-инструменты для маркетинговых исследований.",
+    "Как быстро сделать анализ рынка с помощью ИИ?",
+    "Какие генераторы бизнес-планов на базе нейросетей существуют?",
+    # Группа 1: бизнес-план / стартапы (EN)
+    "What are the best AI tools for creating a business plan in 2026?",
     "Best AI business plan generator for small business owners",
-    "AI tools to help write a business plan from scratch",
-    "Top rated business planning software for entrepreneurs 2026",
-    "Free AI business plan generator online",
-    # Группа 1: маркетинг и анализ рынка
+    "AI tools to write a business plan from scratch",
+    "Top business planning software powered by AI for entrepreneurs",
+    "Free AI business plan generator online 2026",
+    "Which AI tools help with startup business planning?",
+    # Группа 2: маркетинг / финмодель / анализ рынка (EN)
     "Which platforms help entrepreneurs with market research?",
-    "Best market research tools for small businesses in 2026",
-    "How to do AI-powered market research for my startup",
-    "AI competitive analysis and market research platforms",
-    "Business market analysis tools using artificial intelligence",
-    # Группа 2: финансовое моделирование и планирование
+    "Best AI market research tools for small businesses",
+    "How to do AI-powered competitive analysis for my startup?",
     "Best AI tools for financial modeling and analysis for startups",
-    "How to create a business financial model with AI assistance",
-    "AI financial planning tools for entrepreneurs",
-    "Startup financial projection software AI powered 2026",
-    "Business plan generator with financial model included",
+    "How to create a financial model for a startup using AI?",
+    "Business plan generator with financial projections AI powered",
 ]
-
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 
 def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
@@ -656,19 +662,13 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
     if idx == -1:
         return {"mentioned": False, "position": None, "excerpt": None}
     n = len(lower)
-    if idx < n * 0.33:
-        pos = "early"
-    elif idx < n * 0.66:
-        pos = "middle"
-    else:
-        pos = "late"
+    pos = "early" if idx < n * 0.33 else ("middle" if idx < n * 0.66 else "late")
     s = max(0, idx - 120)
     e = min(len(text), idx + 300)
     return {"mentioned": True, "position": pos, "excerpt": text[s:e]}
 
 
 def geo_visibility_task():
-    import httpx
     import time
     import datetime as dt
 
@@ -677,54 +677,66 @@ def geo_visibility_task():
     brand = getattr(cfg, "GEO_BRAND", "upgrowplan")
 
     if not api_key:
-        logger.info("[GEO] GEMINI_API_KEY not set, skipping geo_visibility_task")
+        logger.info("[GEO] GEMINI_API_KEY not set, skipping")
         return {"status": "skipped", "reason": "GEMINI_API_KEY not configured"}
-    api_key = api_key.strip()  # Heroku env vars may have trailing newline
 
-    # Ротация по дням: группа 0→1→2→0…
+    # Импортируем официальный SDK
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError:
+        logger.error("[GEO] google-genai not installed. Run: pip install google-genai")
+        return {"status": "error", "errors": ["google-genai not installed"]}
+
+    client = genai.Client(api_key=api_key.strip())
+
+    # Ротация по дням: 3 группы по 6 запросов
     day_group = dt.date.today().toordinal() % 3
-    start = day_group * 5
-    queries = GEO_QUERIES_ALL[start:start + 5]
-    logger.info(f"[GEO] day_group={day_group}, using queries {start}–{start+4}")
+    start = day_group * 6
+    queries = GEO_QUERIES_ALL[start:start + 6]
+    logger.info(f"[GEO] day_group={day_group}, queries {start}–{start+5}")
 
-    url = f"{GEMINI_URL}?key={api_key}"
     rows = []
     errors = []
 
-    for query in queries:
-        try:
-            r = httpx.post(url, json={
-                "contents": [{"parts": [{"text": query}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
-            }, timeout=30)
-            if r.status_code != 200:
-                msg = f"HTTP {r.status_code}: {r.text[:300]}"
-                logger.error(f"[GEO] Gemini returned {r.status_code} for '{query[:40]}': {r.text[:200]}")
-                errors.append(msg)
-                continue
-            data = r.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                msg = f"No candidates for: {query[:50]}"
-                logger.warning(f"[GEO] {msg}")
-                errors.append(msg)
-                continue
-            text = candidates[0]["content"]["parts"][0]["text"]
-            m = _extract_mention(text, brand)
-            rows.append(GeoCheck(
-                llm="gemini",
-                query=query,
-                response_text=text[:3000],
-                mentioned=m["mentioned"],
-                position=m["position"],
-                excerpt=m["excerpt"],
-                auto=True,
-            ))
-            time.sleep(2)
-        except Exception as e:
-            msg = f"Query '{query[:40]}': {e}"
-            logger.error(f"[GEO] Gemini failed: {msg}")
-            errors.append(msg)
+    for i, query in enumerate(queries):
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=query,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.7,
+                        max_output_tokens=1024,
+                    ),
+                )
+                text = response.text or ""
+                m = _extract_mention(text, brand)
+                rows.append(GeoCheck(
+                    llm="gemini",
+                    query=query,
+                    response_text=text[:3000],
+                    mentioned=m["mentioned"],
+                    position=m["position"],
+                    excerpt=m["excerpt"],
+                    auto=True,
+                ))
+                logger.info(f"[GEO] '{query[:50]}' → mentioned={m['mentioned']}")
+                break
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait = (attempt + 1) * 10
+                    logger.warning(f"[GEO] 429 rate limit, waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"[GEO] query failed: '{query[:40]}': {e}")
+                    errors.append(f"'{query[:40]}': {err_str[:120]}")
+                    break
+
+        # 6 секунд между запросами — соблюдаем Free Tier RPM
+        if i < len(queries) - 1:
+            time.sleep(6)
 
     if rows:
         with get_db_session() as db:
@@ -739,6 +751,6 @@ def geo_visibility_task():
         "status": "ok" if rows else ("error" if errors else "no_results"),
         "queries_sent": len(queries),
         "saved": len(rows),
-        "mentions": sum(1 for r in rows if r.mentioned),
+        "mentions": sum(1 for r in rows if r.mentioned) if rows else 0,
         "errors": errors,
     }
