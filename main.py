@@ -755,6 +755,67 @@ async def post_contact(payload: dict, db: Session = Depends(get_db)):
         else:
             logger.info("Brevo API key not configured — email saved to DB only")
 
+        # Авто-ответ пользователю
+        is_beta = 'beta' in message_text.lower() or 'бета' in message_text.lower() or 'wishlist' in message_text.lower()
+        auto_reply_subject = "Thank you for your interest in Upgrowplan!"
+        auto_reply_text = (
+            f"Hi{' ' + name if name else ''},\n\n"
+            + (
+                "Thank you for signing up! We've added you to our early access list.\n"
+                "We'll reach out as soon as your spot opens up.\n\n"
+                if is_beta else
+                "We've received your message and will get back to you as soon as possible.\n\n"
+            )
+            + "Best regards,\nThe Upgrowplan Team\nupgrowplan.com\n\n"
+            + "---\n"
+            + (
+                "Спасибо за интерес к проекту! Мы добавили вас в список ранних пользователей и свяжемся с вами, когда место откроется.\n"
+                if is_beta else
+                "Мы получили ваше сообщение и ответим в ближайшее время. Спасибо за интерес к проекту Upgrowplan!\n"
+            )
+        )
+        auto_reply_html = (
+            "<html><body style='font-family:Arial,sans-serif;max-width:600px;margin:0 auto;'>"
+            "<div style='background:#1e6078;padding:20px;border-radius:8px 8px 0 0;'>"
+            "<img src='https://www.upgrowplan.com/logo.png' alt='Upgrowplan' style='height:32px;' onerror=\"this.style.display='none'\">"
+            "<h2 style='color:#fff;margin:8px 0 0;'>Upgrowplan</h2></div>"
+            "<div style='background:#f8fafc;padding:24px;border-radius:0 0 8px 8px;border:1px solid #e2e8f0;'>"
+            + (f"<p>Hi{' <strong>' + name + '</strong>' if name else ''},</p>" )
+            + (
+                "<p>Thank you for signing up! 🎉<br>We've added you to our <strong>early access list</strong>. We'll reach out as soon as your spot opens up.</p>"
+                if is_beta else
+                "<p>We've received your message and will get back to you as soon as possible. Thank you for reaching out!</p>"
+            )
+            + "<p style='color:#64748b;font-size:13px;margin-top:24px;border-top:1px solid #e2e8f0;padding-top:12px;'>"
+            + (
+                "Спасибо за интерес к проекту! Мы добавили вас в список ранних пользователей и свяжемся с вами, когда место откроется."
+                if is_beta else
+                "Мы получили ваше сообщение и ответим в ближайшее время. Спасибо за интерес к проекту Upgrowplan!"
+            )
+            + "</p>"
+            "<p style='color:#94a3b8;font-size:12px;'>The Upgrowplan Team · <a href='https://www.upgrowplan.com' style='color:#1e6078;'>upgrowplan.com</a></p>"
+            "</div></body></html>"
+        )
+
+        if brevo_key and email_addr:
+            try:
+                import httpx as _httpx
+                _httpx.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    headers={"api-key": brevo_key, "Content-Type": "application/json"},
+                    json={
+                        "sender": {"name": "Upgrowplan Team", "email": from_email},
+                        "to": [{"email": email_addr}],
+                        "subject": auto_reply_subject,
+                        "htmlContent": auto_reply_html,
+                        "textContent": auto_reply_text,
+                    },
+                    timeout=15,
+                )
+                logger.info(f"Auto-reply sent to {email_addr}")
+            except Exception as e:
+                logger.warning(f"Auto-reply send failed: {e}")
+
         # Сохраняем в БД
         email_row = Email(
             message_id=None,
