@@ -15,8 +15,6 @@ redis==5.0.1
 # HTTP клиент
 httpx==0.25.1
 
-# Gemini API (official SDK for GEO Visibility)
-google-genai>=1.0.0
 
 # Auth (валидация admin-JWT от user-service)
 PyJWT==2.8.0

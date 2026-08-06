@@ -668,9 +668,34 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
     return {"mentioned": True, "position": pos, "excerpt": text[s:e]}
 
 
+GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+
+def _gemini_post(api_key: str, prompt: str) -> str:
+    """Call Gemini REST API via stdlib urllib — no external deps, safe key encoding."""
+    import urllib.request
+    import urllib.parse
+    import json as _json
+
+    params = urllib.parse.urlencode({"key": api_key.strip()})
+    url = f"{GEMINI_REST_URL}?{params}"
+    payload = _json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = _json.loads(resp.read())
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise ValueError("No candidates in Gemini response")
+    return candidates[0]["content"]["parts"][0]["text"]
+
+
 def geo_visibility_task():
     import time
     import datetime as dt
+    import urllib.error
 
     cfg = get_config()
     api_key = getattr(cfg, "GEMINI_API_KEY", None)
@@ -680,15 +705,7 @@ def geo_visibility_task():
         logger.info("[GEO] GEMINI_API_KEY not set, skipping")
         return {"status": "skipped", "reason": "GEMINI_API_KEY not configured"}
 
-    # Импортируем официальный SDK
-    try:
-        from google import genai
-        from google.genai import types as genai_types
-    except ImportError:
-        logger.error("[GEO] google-genai not installed. Run: pip install google-genai")
-        return {"status": "error", "errors": ["google-genai not installed"]}
-
-    client = genai.Client(api_key=api_key.strip())
+    api_key = api_key.strip()
 
     # Ротация по дням: 3 группы по 6 запросов
     day_group = dt.date.today().toordinal() % 3
@@ -702,15 +719,7 @@ def geo_visibility_task():
     for i, query in enumerate(queries):
         for attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=query,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=0.7,
-                        max_output_tokens=1024,
-                    ),
-                )
-                text = response.text or ""
+                text = _gemini_post(api_key, query)
                 m = _extract_mention(text, brand)
                 rows.append(GeoCheck(
                     llm="gemini",
@@ -723,16 +732,22 @@ def geo_visibility_task():
                 ))
                 logger.info(f"[GEO] '{query[:50]}' → mentioned={m['mentioned']}")
                 break
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    wait = (attempt + 1) * 10
-                    logger.warning(f"[GEO] 429 rate limit, waiting {wait}s...")
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")[:300]
+                if e.code == 429:
+                    wait = (attempt + 1) * 15
+                    logger.warning(f"[GEO] 429 rate limit, waiting {wait}s (attempt {attempt+1})...")
                     time.sleep(wait)
                 else:
-                    logger.error(f"[GEO] query failed: '{query[:40]}': {e}")
-                    errors.append(f"'{query[:40]}': {err_str[:120]}")
+                    msg = f"'{query[:40]}': HTTP {e.code} {body}"
+                    logger.error(f"[GEO] {msg}")
+                    errors.append(msg)
                     break
+            except Exception as e:
+                msg = f"'{query[:40]}': {e}"
+                logger.error(f"[GEO] {msg}")
+                errors.append(msg)
+                break
 
         # 6 секунд между запросами — соблюдаем Free Tier RPM
         if i < len(queries) - 1:
