@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func, text
@@ -426,14 +426,11 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
 
 
 @app.post("/api/monitoring/geo/scan")
-async def geo_scan_now():
-    """Запустить GEO-скан через Gemini немедленно. Возвращает результат и ошибки."""
+async def geo_scan_now(background_tasks: BackgroundTasks):
+    """Запускает GEO-скан в фоне, сразу возвращает ответ (Heroku H12 prevention)."""
     from monitoring.tasks import geo_visibility_task
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, geo_visibility_task)
-    if isinstance(result, dict) and result.get("status") == "skipped":
-        return JSONResponse({"status": "skipped", "reason": result.get("reason", "API key not configured")})
-    return {"status": "ok", "result": result or {}}
+    background_tasks.add_task(geo_visibility_task)
+    return {"status": "started", "message": "Скан запущен в фоне (~60–90 сек). Данные появятся после завершения."}
 
 
 @app.post("/api/monitoring/geo/manual")
