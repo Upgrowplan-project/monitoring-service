@@ -741,6 +741,7 @@ def _geo_visibility_task_impl():
         if quota_exceeded:
             break
         success = False
+        error_reason = None
         for attempt in range(3):
             try:
                 text = _gemini_post(api_key, query)
@@ -765,20 +766,32 @@ def _geo_visibility_task_impl():
                         logger.warning(f"[GEO] 429 rate limit, waiting {wait}s (attempt {attempt+1})...")
                         time.sleep(wait)
                     else:
-                        # Все 3 попытки — 429, значит дневная квота исчерпана
                         logger.error(f"[GEO] quota exhausted after 3 retries, aborting scan")
+                        error_reason = "[ERROR: quota_exceeded] Дневной лимит Gemini исчерпан"
                         errors.append("Gemini quota exhausted (daily limit). Try again tomorrow.")
                         quota_exceeded = True
                 else:
-                    msg = f"'{query[:40]}': HTTP {e.code} {body}"
-                    logger.error(f"[GEO] {msg}")
-                    errors.append(msg)
+                    error_reason = f"[ERROR: http_{e.code}] {body[:100]}"
+                    logger.error(f"[GEO] '{query[:40]}': HTTP {e.code}")
+                    errors.append(f"'{query[:40]}': HTTP {e.code}")
                     break
             except Exception as e:
-                msg = f"'{query[:40]}': {e}"
-                logger.error(f"[GEO] {msg}")
-                errors.append(msg)
+                error_reason = f"[ERROR: exception] {str(e)[:100]}"
+                logger.error(f"[GEO] '{query[:40]}': {e}")
+                errors.append(f"'{query[:40]}': {e}")
                 break
+
+        # Сохраняем запись даже при ошибке — чтобы в UI не было пустоты
+        if not success and error_reason:
+            rows.append(GeoCheck(
+                llm="gemini",
+                query=query,
+                response_text=error_reason,
+                mentioned=False,
+                position=None,
+                excerpt=error_reason,
+                auto=True,
+            ))
 
         if success and i < len(queries) - 1:
             time.sleep(6)

@@ -412,14 +412,18 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
         }
         for r in rows
     ]
-    # Сводка по LLM
+    # Сводка по LLM — error-записи не учитываются в проценте
     from collections import defaultdict
-    summary: dict = defaultdict(lambda: {"total": 0, "mentioned": 0, "last_check": None})
+    summary: dict = defaultdict(lambda: {"total": 0, "mentioned": 0, "errors": 0, "last_check": None})
     for r in rows:
         s = summary[r.llm]
-        s["total"] += 1
-        if r.mentioned:
-            s["mentioned"] += 1
+        is_error = (r.excerpt or "").startswith("[ERROR:") or (r.response_text or "").startswith("[ERROR:")
+        if is_error:
+            s["errors"] += 1
+        else:
+            s["total"] += 1
+            if r.mentioned:
+                s["mentioned"] += 1
         if s["last_check"] is None or r.created_at.isoformat() > s["last_check"]:
             s["last_check"] = r.created_at.isoformat()
     return {"items": items, "summary": dict(summary)}
