@@ -670,6 +670,9 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
 
 GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
+# Предотвращаем параллельные запуски скана
+_geo_scan_running = False
+
 
 def _gemini_post(api_key: str, prompt: str) -> str:
     """Call Gemini REST API via stdlib urllib — no external deps, safe key encoding."""
@@ -696,6 +699,23 @@ def geo_visibility_task():
     import time
     import datetime as dt
     import urllib.error
+    global _geo_scan_running
+
+    if _geo_scan_running:
+        logger.warning("[GEO] scan already running, skipping duplicate trigger")
+        return {"status": "skipped", "reason": "scan already in progress"}
+
+    _geo_scan_running = True
+    try:
+        return _geo_visibility_task_impl()
+    finally:
+        _geo_scan_running = False
+
+
+def _geo_visibility_task_impl():
+    import time
+    import datetime as dt
+    import urllib.error
 
     cfg = get_config()
     api_key = getattr(cfg, "GEMINI_API_KEY", None)
@@ -711,12 +731,16 @@ def geo_visibility_task():
     day_group = dt.date.today().toordinal() % 3
     start = day_group * 6
     queries = GEO_QUERIES_ALL[start:start + 6]
-    logger.info(f"[GEO] day_group={day_group}, queries {start}–{start+5}")
+    logger.info(f"[GEO] day_group={day_group}, queries {start}-{start+5}")
 
     rows = []
     errors = []
+    quota_exceeded = False
 
     for i, query in enumerate(queries):
+        if quota_exceeded:
+            break
+        success = False
         for attempt in range(3):
             try:
                 text = _gemini_post(api_key, query)
@@ -730,14 +754,21 @@ def geo_visibility_task():
                     excerpt=m["excerpt"],
                     auto=True,
                 ))
-                logger.info(f"[GEO] '{query[:50]}' → mentioned={m['mentioned']}")
+                logger.info(f"[GEO] '{query[:50]}' -> mentioned={m['mentioned']}")
+                success = True
                 break
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", errors="replace")[:300]
                 if e.code == 429:
-                    wait = (attempt + 1) * 15
-                    logger.warning(f"[GEO] 429 rate limit, waiting {wait}s (attempt {attempt+1})...")
-                    time.sleep(wait)
+                    if attempt < 2:
+                        wait = (attempt + 1) * 15
+                        logger.warning(f"[GEO] 429 rate limit, waiting {wait}s (attempt {attempt+1})...")
+                        time.sleep(wait)
+                    else:
+                        # Все 3 попытки — 429, значит дневная квота исчерпана
+                        logger.error(f"[GEO] quota exhausted after 3 retries, aborting scan")
+                        errors.append("Gemini quota exhausted (daily limit). Try again tomorrow.")
+                        quota_exceeded = True
                 else:
                     msg = f"'{query[:40]}': HTTP {e.code} {body}"
                     logger.error(f"[GEO] {msg}")
@@ -749,8 +780,7 @@ def geo_visibility_task():
                 errors.append(msg)
                 break
 
-        # 6 секунд между запросами — соблюдаем Free Tier RPM
-        if i < len(queries) - 1:
+        if success and i < len(queries) - 1:
             time.sleep(6)
 
     if rows:
@@ -762,9 +792,10 @@ def geo_visibility_task():
     if errors:
         logger.warning(f"[GEO] {len(errors)} errors during scan")
 
+    status = "quota_exceeded" if quota_exceeded else ("ok" if rows else ("error" if errors else "no_results"))
     return {
-        "status": "ok" if rows else ("error" if errors else "no_results"),
-        "queries_sent": len(queries),
+        "status": status,
+        "queries_sent": len(rows) + (1 if quota_exceeded else 0),
         "saved": len(rows),
         "mentions": sum(1 for r in rows if r.mentioned) if rows else 0,
         "errors": errors,
