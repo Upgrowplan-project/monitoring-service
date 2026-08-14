@@ -668,7 +668,7 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
     return {"mentioned": True, "position": pos, "excerpt": text[s:e]}
 
 
-GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 # Предотвращаем параллельные запуски скана
 _geo_scan_running = False
@@ -796,20 +796,24 @@ def _geo_visibility_task_impl():
         if success and i < len(queries) - 1:
             time.sleep(6)
 
+    # Считаем mentions ДО сохранения в БД — чтобы не обращаться к ORM-объектам
+    # после db.commit() (expire_on_commit=True вызовет DetachedInstanceError)
+    n_saved = len(rows)
+    n_mentions = sum(1 for r in rows if r.mentioned)
+
     if rows:
         with get_db_session() as db:
             db.add_all(rows)
             db.commit()
-        mentions = sum(1 for r in rows if r.mentioned)
-        logger.info(f"[GEO] scan done: {len(rows)} saved, {mentions}/{len(rows)} mentions of '{brand}'")
+        logger.info(f"[GEO] scan done: {n_saved} saved, {n_mentions}/{n_saved} mentions of '{brand}'")
     if errors:
         logger.warning(f"[GEO] {len(errors)} errors during scan")
 
-    status = "quota_exceeded" if quota_exceeded else ("ok" if rows else ("error" if errors else "no_results"))
+    status = "quota_exceeded" if quota_exceeded else ("ok" if n_saved else ("error" if errors else "no_results"))
     return {
         "status": status,
-        "queries_sent": len(rows) + (1 if quota_exceeded else 0),
-        "saved": len(rows),
-        "mentions": sum(1 for r in rows if r.mentioned) if rows else 0,
+        "queries_sent": n_saved + (1 if quota_exceeded else 0),
+        "saved": n_saved,
+        "mentions": n_mentions,
         "errors": errors,
     }
