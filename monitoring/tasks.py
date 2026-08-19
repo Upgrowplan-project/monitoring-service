@@ -668,7 +668,10 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
     return {"mentioned": True, "position": pos, "excerpt": text[s:e]}
 
 
-GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+def _get_gemini_url() -> str:
+    import os
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # Предотвращаем параллельные запуски скана
 _geo_scan_running = False
@@ -681,7 +684,7 @@ def _gemini_post(api_key: str, prompt: str) -> str:
     import json as _json
 
     params = urllib.parse.urlencode({"key": api_key.strip()})
-    url = f"{GEMINI_REST_URL}?{params}"
+    url = f"{_get_gemini_url()}?{params}"
     payload = _json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
