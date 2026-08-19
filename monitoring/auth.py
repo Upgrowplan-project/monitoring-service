@@ -29,6 +29,7 @@ PUBLIC_ENDPOINTS = {
 INGEST_ENDPOINTS = {
     ("POST", "/api/monitoring/reports"),
     ("POST", "/api/monitoring/synthesis-logs"),
+    ("POST", "/api/monitoring/bot-crawl"),
 }
 
 

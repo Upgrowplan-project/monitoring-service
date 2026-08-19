@@ -23,7 +23,7 @@ from monitoring import (
     UserRating,
     WebEvent,
 )
-from monitoring.models import GeoCheck
+from monitoring.models import GeoCheck, BotCrawlEvent
 from monitoring.ratings_api import router as ratings_router
 from monitoring import auth as mon_auth
 from fastapi.responses import JSONResponse
@@ -1517,6 +1517,192 @@ async def get_user_stats():
     except Exception as e:
         logger.error(f"Error fetching user-service stats: {e}")
         return {"configured": True, "error": str(e)}
+
+
+# ============================================================
+# GEO Visibility — AI bot crawl tracking
+# ============================================================
+
+# Known AI crawler patterns: (display_name, ua_substring_lowercase)
+_AI_BOT_PATTERNS = [
+    ("GPTBot",            "gptbot"),
+    ("OAI-SearchBot",     "oai-searchbot"),
+    ("ChatGPT-User",      "chatgpt-user"),
+    ("PerplexityBot",     "perplexitybot"),
+    ("Perplexity-User",   "perplexity-user"),
+    ("ClaudeBot",         "claudebot"),
+    ("Claude-User",       "claude-user"),
+    ("Claude-SearchBot",  "claude-searchbot"),
+    ("anthropic-ai",      "anthropic-ai"),
+    ("Google-Extended",   "google-extended"),
+    ("CCBot",             "ccbot"),
+    ("Applebot-Extended", "applebot-extended"),
+    ("Meta-ExternalAgent","meta-externalagent"),
+    ("Gemini",            "google-inspectiontool"),
+]
+
+def _detect_bot(ua: str) -> Optional[str]:
+    """Возвращает имя AI-бота или None если UA не совпадает."""
+    if not ua:
+        return None
+    u = ua.lower()
+    for name, pattern in _AI_BOT_PATTERNS:
+        if pattern in u:
+            return name
+    return None
+
+
+@app.post("/api/monitoring/bot-crawl")
+async def ingest_bot_crawl(payload: dict, db: Session = Depends(get_db)):
+    """
+    Fire-and-forget ingest: фронт (Next.js middleware) сообщает о визите AI-краулера.
+    Требует X-Ingest-Token. Не блокирует ответ пользователю.
+
+    Тело: { bot_name, bot_raw_ua?, url_path, crawled_at? }
+    """
+    bot_name = (payload.get("bot_name") or "").strip()
+    url_path  = (payload.get("url_path") or "").strip()
+    if not bot_name or not url_path:
+        raise HTTPException(status_code=400, detail="bot_name and url_path are required")
+
+    crawled_at = _parse_iso(payload.get("crawled_at")) or datetime.utcnow()
+
+    try:
+        db.add(BotCrawlEvent(
+            bot_name=bot_name,
+            bot_raw_ua=payload.get("bot_raw_ua"),
+            url_path=url_path,
+            crawled_at=crawled_at,
+        ))
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"bot-crawl ingest error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Статьи блога с датами публикации (для расчёта time-to-first-crawl)
+_BLOG_POSTS = {
+    "/blog/milan-coffee-shop-market-2026":                          "2026-07-26",
+    "/blog/financial-stress-test-5-metrics":                       "2026-07-26",
+    "/blog/online-english-school-market-2026-competitor-analysis":  "2026-08-14",
+}
+
+
+@app.get("/api/monitoring/visibility/bot-crawls")
+async def get_bot_crawls(
+    days: int = 90,
+    db: Session = Depends(get_db),
+):
+    """
+    GEO Visibility — аналитика AI-краулеров:
+    - recent_events: последние 100 событий
+    - by_bot: сколько визитов от каждого бота
+    - by_page: какие страницы, кто посещал, когда впервые
+    - recommendations: что сделать чтобы улучшить охват
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    events = (
+        db.query(BotCrawlEvent)
+        .filter(BotCrawlEvent.crawled_at >= cutoff)
+        .order_by(BotCrawlEvent.crawled_at.desc())
+        .limit(200)
+        .all()
+    )
+
+    # --- by_bot ---
+    bot_counts: dict[str, int] = {}
+    for e in events:
+        bot_counts[e.bot_name] = bot_counts.get(e.bot_name, 0) + 1
+
+    # --- by_page ---
+    page_map: dict[str, dict] = {}
+    for e in events:
+        p = e.url_path
+        if p not in page_map:
+            page_map[p] = {"path": p, "bots": set(), "count": 0, "first_crawl": e.crawled_at, "last_crawl": e.crawled_at}
+        page_map[p]["bots"].add(e.bot_name)
+        page_map[p]["count"] += 1
+        if e.crawled_at < page_map[p]["first_crawl"]:
+            page_map[p]["first_crawl"] = e.crawled_at
+        if e.crawled_at > page_map[p]["last_crawl"]:
+            page_map[p]["last_crawl"] = e.crawled_at
+
+    # Обогащаем страницы датой публикации и time_to_first_crawl_days
+    for path, info in page_map.items():
+        pub = _BLOG_POSTS.get(path)
+        info["published_at"] = pub
+        if pub:
+            pub_dt = datetime.strptime(pub, "%Y-%m-%d")
+            delta = (info["first_crawl"] - pub_dt).days
+            info["days_to_first_crawl"] = max(0, delta)
+        else:
+            info["days_to_first_crawl"] = None
+        info["bots"] = sorted(info["bots"])
+        info["first_crawl"] = info["first_crawl"].isoformat()
+        info["last_crawl"] = info["last_crawl"].isoformat()
+
+    # --- recommendations ---
+    recommendations = []
+    crawled_paths = set(page_map.keys())
+    for path, pub in _BLOG_POSTS.items():
+        if path not in crawled_paths:
+            pub_dt = datetime.strptime(pub, "%Y-%m-%d")
+            age_days = (datetime.utcnow() - pub_dt).days
+            if age_days >= 7:
+                recommendations.append({
+                    "type": "not_crawled",
+                    "severity": "warning" if age_days < 30 else "critical",
+                    "path": path,
+                    "published_at": pub,
+                    "age_days": age_days,
+                    "action": "Submit to Bing IndexNow and share on LinkedIn to attract AI-bot discovery.",
+                })
+        else:
+            info = page_map[path]
+            if info["days_to_first_crawl"] is not None and info["days_to_first_crawl"] > 14:
+                recommendations.append({
+                    "type": "slow_discovery",
+                    "severity": "info",
+                    "path": path,
+                    "days_to_first_crawl": info["days_to_first_crawl"],
+                    "action": "Discovery took over 2 weeks — add IndexNow or increase inbound links.",
+                })
+            known_bots = {"GPTBot", "OAI-SearchBot", "PerplexityBot", "ClaudeBot"}
+            missing = known_bots - set(info["bots"])
+            if missing:
+                recommendations.append({
+                    "type": "missing_bots",
+                    "severity": "info",
+                    "path": path,
+                    "missing_bots": sorted(missing),
+                    "action": f"Not yet crawled by {', '.join(sorted(missing))}. Check robots.txt allows these bots.",
+                })
+
+    if not bot_counts:
+        recommendations.insert(0, {
+            "type": "no_data",
+            "severity": "warning",
+            "action": "No AI bot crawl events yet. Deploy the middleware bot-detection to start collecting data.",
+        })
+
+    return {
+        "period_days": days,
+        "total_events": len(events),
+        "by_bot": bot_counts,
+        "by_page": list(page_map.values()),
+        "recommendations": recommendations,
+        "recent_events": [
+            {
+                "bot_name": e.bot_name,
+                "url_path": e.url_path,
+                "crawled_at": e.crawled_at.isoformat(),
+            }
+            for e in events[:100]
+        ],
+    }
 
 
 if __name__ == "__main__":

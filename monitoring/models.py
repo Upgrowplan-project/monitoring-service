@@ -317,6 +317,26 @@ class GeoCheck(Base):
         return f"<GeoCheck(llm={self.llm}, mentioned={self.mentioned}, created_at={self.created_at})>"
 
 
+class BotCrawlEvent(Base):
+    """
+    Событие сканирования AI-ботом (GPTBot, PerplexityBot, ClaudeBot и др.).
+    Пишется fire-and-forget из Next.js middleware при каждом визите AI-краулера.
+    Используется для GEO Visibility: какие страницы индексируют AI, как быстро,
+    кто именно — основа для рекомендаций growth agent.
+    """
+    __tablename__ = "bot_crawl_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bot_name = Column(String(100), nullable=False, index=True)   # GPTBot | PerplexityBot | ClaudeBot | ...
+    bot_raw_ua = Column(Text, nullable=True)                     # полный User-Agent
+    url_path = Column(String(1024), nullable=False, index=True)  # /blog/xxx
+    crawled_at = Column(DateTime, nullable=False, index=True)    # время визита (UTC)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<BotCrawlEvent(bot={self.bot_name}, path={self.url_path}, at={self.crawled_at})>"
+
+
 class EmailAttachment(Base):
     """Метаданные вложений"""
     __tablename__ = "email_attachments"
