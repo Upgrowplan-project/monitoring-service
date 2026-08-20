@@ -23,6 +23,7 @@ PUBLIC_ENDPOINTS = {
     ("POST", "/api/rating"),
     ("POST", "/api/monitoring/pageview"),
     ("POST", "/api/monitoring/contact"),
+    ("GET", "/api/monitoring/reports/debug"),
 }
 
 # Server-to-server ingest (нужен X-Ingest-Token, не admin-JWT).
