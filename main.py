@@ -1129,7 +1129,8 @@ async def ingest_research_report(payload: dict, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Error ingesting research report {research_id}: {e}")
+        import traceback
+        logger.error(f"Error ingesting research report {research_id}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1188,6 +1189,7 @@ async def ingest_synthesis_logs(payload: dict, db: Session = Depends(get_db)):
 async def debug_research_reports(db: Session = Depends(get_db)):
     """Диагностика: сколько записей в research_reports и synthesis_logs."""
     try:
+        from sqlalchemy import func as sa_func
         rr_count = db.query(ResearchReport).count()
         sl_count = db.query(SynthesisLog).count()
         latest = (
@@ -1196,9 +1198,32 @@ async def debug_research_reports(db: Session = Depends(get_db)):
             .limit(3)
             .all()
         )
+        # Breakdown synthesis_logs by service_name
+        sl_by_service = (
+            db.query(SynthesisLog.service_name, sa_func.count(SynthesisLog.id))
+            .group_by(SynthesisLog.service_name)
+            .all()
+        )
+        # Last 5 synthesis_logs from MRS specifically
+        mrs_logs = (
+            db.query(SynthesisLog)
+            .filter(SynthesisLog.service_name == "market-research-service")
+            .order_by(SynthesisLog.created_at.desc())
+            .limit(5)
+            .all()
+        )
         return {
             "research_reports_total": rr_count,
             "synthesis_logs_total": sl_count,
+            "synthesis_logs_by_service": {sn or "null": cnt for sn, cnt in sl_by_service},
+            "mrs_synthesis_logs_last5": [
+                {
+                    "session_id": l.session_id,
+                    "message": l.message[:100] if l.message else None,
+                    "created_at": l.created_at.isoformat() if l.created_at else None,
+                }
+                for l in mrs_logs
+            ],
             "latest_3": [
                 {
                     "research_id": r.research_id,
