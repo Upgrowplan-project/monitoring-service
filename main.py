@@ -1184,6 +1184,36 @@ async def ingest_synthesis_logs(payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/monitoring/reports/debug")
+async def debug_research_reports(db: Session = Depends(get_db)):
+    """Диагностика: сколько записей в research_reports и synthesis_logs."""
+    try:
+        rr_count = db.query(ResearchReport).count()
+        sl_count = db.query(SynthesisLog).count()
+        latest = (
+            db.query(ResearchReport)
+            .order_by(ResearchReport.created_at.desc())
+            .limit(3)
+            .all()
+        )
+        return {
+            "research_reports_total": rr_count,
+            "synthesis_logs_total": sl_count,
+            "latest_3": [
+                {
+                    "research_id": r.research_id,
+                    "service_name": r.service_name,
+                    "product_name": r.product_name,
+                    "status": r.status,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in latest
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/monitoring/reports")
 async def list_research_reports(
     service_name: Optional[str] = None,
