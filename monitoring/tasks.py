@@ -627,7 +627,7 @@ def visibility_scan_task():
 
 # ---------------------------------------------------------------------------
 # GEO queries: 18 запросов = 3 группы × 6, ротация каждый день.
-# Группа 0: прямые брендовые (RU+EN)
+# Группа 0: прямые брендовые и общие категорийные (RU + EN-дубли)
 # Группа 1: бизнес-план / стартапы (EN)
 # Группа 2: маркетинг / финмодель (EN)
 # ---------------------------------------------------------------------------
@@ -655,6 +655,17 @@ GEO_QUERIES_ALL = [
     "Business plan generator with financial projections AI powered",
 ]
 
+# English equivalents are submitted alongside their Russian originals so the
+# dashboard tracks Gemini visibility in both language markets.
+GEO_QUERY_EN_DUPLICATES = {
+    "Что такое Upgrowplan и для чего он нужен?": "What is Upgrowplan and what is it used for?",
+    "Для чего предназначен сайт upgrowplan.com?": "What is the purpose of upgrowplan.com?",
+    "Какие ИИ-сервисы помогают составить бизнес-план для стартапа?": "Which AI services help create a business plan for a startup?",
+    "Посоветуй лучшие ИИ-инструменты для маркетинговых исследований.": "Recommend the best AI tools for market research.",
+    "Как быстро сделать анализ рынка с помощью ИИ?": "How can I quickly conduct market research using AI?",
+    "Какие генераторы бизнес-планов на базе нейросетей существуют?": "Which AI-powered business plan generators are available?",
+}
+
 
 def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
     lower = text.lower()
@@ -670,7 +681,7 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
 
 def _get_gemini_url() -> str:
     import os
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # Предотвращаем параллельные запуски скана
@@ -733,8 +744,17 @@ def _geo_visibility_task_impl():
     # Ротация по дням: 3 группы по 6 запросов
     day_group = dt.date.today().toordinal() % 3
     start = day_group * 6
-    queries = GEO_QUERIES_ALL[start:start + 6]
-    logger.info(f"[GEO] day_group={day_group}, queries {start}-{start+5}")
+    base_queries = GEO_QUERIES_ALL[start:start + 6]
+    queries = [
+        query_variant
+        for query in base_queries
+        for query_variant in (query, GEO_QUERY_EN_DUPLICATES.get(query))
+        if query_variant
+    ]
+    logger.info(
+        f"[GEO] day_group={day_group}, base queries {start}-{start+5}, "
+        f"submitted={len(queries)}"
+    )
 
     rows = []
     errors = []
