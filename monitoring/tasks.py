@@ -680,8 +680,9 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
 
 
 def _get_gemini_url() -> str:
-    import os
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    # Google keeps this alias on the current Flash release, avoiding retired
+    # version-specific endpoints such as gemini-2.0-flash.
+    model = "gemini-flash-latest"
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # Предотвращаем параллельные запуски скана

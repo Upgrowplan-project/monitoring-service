@@ -399,6 +399,11 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
         .limit(limit)
         .all()
     )
+    def is_error(row: GeoCheck) -> bool:
+        return (row.excerpt or "").startswith("[ERROR:") or (row.response_text or "").startswith("[ERROR:")
+
+    visible_rows = [row for row in rows if not is_error(row)]
+    error_rows = [row for row in rows if is_error(row)]
     items = [
         {
             "id": r.id,
@@ -410,15 +415,24 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
             "auto": r.auto,
             "created_at": r.created_at.isoformat(),
         }
-        for r in rows
+        for r in visible_rows
+    ]
+    error_items = [
+        {
+            "id": r.id,
+            "llm": r.llm,
+            "query": r.query,
+            "excerpt": r.excerpt or r.response_text,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in error_rows
     ]
     # Сводка по LLM — error-записи не учитываются в проценте
     from collections import defaultdict
     summary: dict = defaultdict(lambda: {"total": 0, "mentioned": 0, "errors": 0, "last_check": None})
     for r in rows:
         s = summary[r.llm]
-        is_error = (r.excerpt or "").startswith("[ERROR:") or (r.response_text or "").startswith("[ERROR:")
-        if is_error:
+        if is_error(r):
             s["errors"] += 1
         else:
             s["total"] += 1
@@ -426,7 +440,7 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
                 s["mentioned"] += 1
         if s["last_check"] is None or r.created_at.isoformat() > s["last_check"]:
             s["last_check"] = r.created_at.isoformat()
-    return {"items": items, "summary": dict(summary)}
+    return {"items": items, "error_items": error_items, "summary": dict(summary)}
 
 
 @app.post("/api/monitoring/geo/scan")
