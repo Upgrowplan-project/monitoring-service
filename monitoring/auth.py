@@ -8,12 +8,17 @@
   заголовок X-Ingest-Token == MONITORING_INGEST_TOKEN.
 - Публичные эндпоинты (beacon, оценки, контакт-форма) — без авторизации.
 
-Если JWT_SECRET не задан — авторизация ВЫКЛЮЧЕНА (удобно для локальной разработки).
-В проде JWT_SECRET обязателен, иначе данные открыты.
+Fail-closed (аудит 2026-09, P0): если JWT_SECRET / MONITORING_INGEST_TOKEN не заданы,
+охраняемые эндпоинты отвечают 503 — а не открываются. Единственный способ выключить
+авторизацию — явный флаг MONITORING_AUTH_DISABLED=1 (только локальная разработка).
 """
 
+import hmac
+import logging
 import os
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Какие префиксы вообще охраняем.
 GUARDED_PREFIXES = ("/api/monitoring", "/api/ratings")
@@ -34,8 +39,24 @@ INGEST_ENDPOINTS = {
 }
 
 
+def auth_disabled_explicitly() -> bool:
+    """Авторизация выключена ТОЛЬКО явным флагом (dev). Отсутствие секрета ≠ выключено."""
+    return os.getenv("MONITORING_AUTH_DISABLED", "").strip() == "1"
+
+
 def auth_enabled() -> bool:
-    return bool(os.getenv("JWT_SECRET"))
+    return not auth_disabled_explicitly()
+
+
+def startup_check() -> None:
+    """Громко предупредить при старте, если прод-конфигурация неполная."""
+    if auth_disabled_explicitly():
+        logger.warning("MONITORING_AUTH_DISABLED=1 — авторизация выключена (только для dev!)")
+        return
+    if not os.getenv("JWT_SECRET"):
+        logger.error("JWT_SECRET не задан — admin-эндпоинты будут отвечать 503 (fail-closed)")
+    if not os.getenv("MONITORING_INGEST_TOKEN"):
+        logger.error("MONITORING_INGEST_TOKEN не задан — ingest-эндпоинты будут отвечать 503 (fail-closed)")
 
 
 def _verify_admin_token(token: str) -> tuple[bool, bool]:
@@ -46,7 +67,7 @@ def _verify_admin_token(token: str) -> tuple[bool, bool]:
     """
     secret = os.getenv("JWT_SECRET")
     if not secret:
-        return True, False
+        return False, False   # fail-closed: без секрета никто не админ
     import jwt  # lazy: PyJWT нужен только когда авторизация включена
     try:
         payload = jwt.decode(
@@ -76,7 +97,7 @@ def check_request(method: str, path: str, authorization: Optional[str], ingest_t
     if method == "OPTIONS":  # CORS preflight
         return None
 
-    if not auth_enabled():  # dev: токены не настроены — пропускаем
+    if not auth_enabled():  # dev: выключено ЯВНЫМ флагом
         return None
 
     if (method, path) in PUBLIC_ENDPOINTS:
@@ -85,12 +106,14 @@ def check_request(method: str, path: str, authorization: Optional[str], ingest_t
     if (method, path) in INGEST_ENDPOINTS:
         expected = os.getenv("MONITORING_INGEST_TOKEN")
         if not expected:
-            return None  # ingest-токен не настроен — не блокируем server-to-server
-        if ingest_token != expected:
+            return (503, "Ingest token not configured")  # fail-closed
+        if not ingest_token or not hmac.compare_digest(ingest_token, expected):
             return (401, "Invalid ingest token")
         return None
 
     # Остальное под /api/monitoring и /api/ratings — только ADMIN.
+    if not os.getenv("JWT_SECRET"):
+        return (503, "Auth not configured")  # fail-closed
     if not authorization or not authorization.startswith("Bearer "):
         return (401, "Missing admin token")
     ok, expired = _verify_admin_token(authorization[7:].strip())
@@ -102,10 +125,10 @@ def check_request(method: str, path: str, authorization: Optional[str], ingest_t
 
 
 def verify_ws_token(token: Optional[str]) -> bool:
-    """Для WebSocket: пускаем если auth выключен или токен — валидный admin-JWT."""
+    """Для WebSocket: пускаем если auth выключен ЯВНО или токен — валидный admin-JWT."""
     if not auth_enabled():
         return True
-    if not token:
+    if not token or not os.getenv("JWT_SECRET"):
         return False
     ok, _ = _verify_admin_token(token)
     return ok

@@ -68,6 +68,7 @@ async def _auth_dispatch(request, call_next):
 
 
 app.add_middleware(BaseHTTPMiddleware, dispatch=_auth_dispatch)
+mon_auth.startup_check()  # fail-closed: без секретов — 503, не открытые данные
 
 # CORS middleware
 app.add_middleware(
