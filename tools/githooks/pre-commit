@@ -1,0 +1,14 @@
+#!/bin/sh
+# Pre-commit hook (versioned). Enable once per clone:  git config core.hooksPath tools/githooks
+# [SECRET-SCAN] Runs FIRST, for every commit (also docs-only): a credential in a .md is a leak too.
+# Bypass one commit: SKIP_SECRET_SCAN=1 git commit ...   Per-line: append  # secret-scan: allow
+_PY=""
+for _c in python python3 py; do
+  if command -v "$_c" >/dev/null 2>&1; then _PY="$_c"; break; fi
+done
+if [ -n "$_PY" ] && [ -f "tools/secret_scan.py" ]; then
+  "$_PY" tools/secret_scan.py --staged || exit 1
+else
+  echo "[secret-scan] WARNING: python or tools/secret_scan.py not found - scan skipped"
+fi
+exit 0

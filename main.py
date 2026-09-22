@@ -26,6 +26,7 @@ from monitoring import (
 from monitoring.models import GeoCheck, BotCrawlEvent
 from monitoring.ratings_api import router as ratings_router
 from monitoring import auth as mon_auth
+from monitoring.contact_guard import ContactIn, contact_limiter, client_ip, html_escape_name
 from fastapi.responses import JSONResponse
 
 # Настройка логирования
@@ -729,15 +730,16 @@ async def resolve_alert(
 
 
 @app.post('/api/monitoring/contact')
-async def post_contact(payload: dict, db: Session = Depends(get_db)):
+async def post_contact(payload: ContactIn, request: Request, db: Session = Depends(get_db)):
     """Приём сообщений с контактной формы: отправка через Brevo API и сохранение в БД"""
+    # Публичный адрес: строгая модель полей (ContactIn) + лимит 3 письма/час с одного IP,
+    # иначе форма — открытый ретранслятор (авто-ответ уходит на любой указанный адрес).
+    if not contact_limiter.allow(client_ip(request)):
+        raise HTTPException(status_code=429, detail='Too many messages, try again later')
     try:
-        name = payload.get('name')
-        email_addr = payload.get('email')
-        message_text = payload.get('message')
-
-        if not email_addr or not message_text:
-            raise HTTPException(status_code=400, detail='Missing required fields')
+        name = payload.name
+        email_addr = payload.email
+        message_text = payload.message
 
         cfg = get_config()
         subject = f"Website contact: {name or email_addr}"
@@ -796,7 +798,7 @@ async def post_contact(payload: dict, db: Session = Depends(get_db)):
             "<img src='https://www.upgrowplan.com/logo.png' alt='Upgrowplan' style='height:32px;' onerror=\"this.style.display='none'\">"
             "<h2 style='color:#fff;margin:8px 0 0;'>Upgrowplan</h2></div>"
             "<div style='background:#f8fafc;padding:24px;border-radius:0 0 8px 8px;border:1px solid #e2e8f0;'>"
-            + (f"<p>Hi{' <strong>' + name + '</strong>' if name else ''},</p>" )
+            + (f"<p>Hi{' <strong>' + html_escape_name(name) + '</strong>' if name else ''},</p>" )
             + (
                 "<p>Thank you for signing up! 🎉<br>We've added you to our <strong>early access list</strong>. We'll reach out as soon as your spot opens up.</p>"
                 if is_beta else
