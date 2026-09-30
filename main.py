@@ -24,6 +24,7 @@ from monitoring import (
     WebEvent,
 )
 from monitoring.models import GeoCheck, BotCrawlEvent
+from monitoring.ai_referrals import classify_ai_source, build_ai_referrals
 from monitoring.ratings_api import router as ratings_router
 from monitoring import auth as mon_auth
 from monitoring.contact_guard import ContactIn, contact_limiter, client_ip, html_escape_name
@@ -1528,8 +1529,28 @@ async def get_analytics(days: int = 30, db: Session = Depends(get_db)):
         {"date": str(r[0]), "views": int(r[1]), "visitors": int(r[2])} for r in ts_rows
     ]
 
-    # Источники: utm_source, иначе домен реферера, иначе "direct"
-    sources = _top(WebEvent.utm_source)
+    # Переходы из нейросетей (utm_source=chatgpt.com, Referer perplexity.ai …) — это GEO:
+    # показываются во вкладке GEO (/visibility/ai-referrals), из SEO-списков исключаются.
+    attributed = (
+        db.query(WebEvent.utm_source, WebEvent.referrer)
+        .filter(
+            WebEvent.created_at >= cutoff,
+            WebEvent.event_type == "pageview",
+            (WebEvent.utm_source.isnot(None)) | (WebEvent.referrer.isnot(None)),
+        )
+        .all()
+    )
+    ai_pageviews = sum(1 for u, r in attributed if classify_ai_source(u, r))
+
+    def _top_non_ai(column, is_utm: bool, limit=10):
+        rows = _top(column, limit=limit + 30)
+        keep = [
+            r for r in rows
+            if not (classify_ai_source(r["key"], None) if is_utm else classify_ai_source(None, r["key"]))
+        ]
+        return keep[:limit]
+
+    sources = _top_non_ai(WebEvent.utm_source, is_utm=True)
 
     # Воронка: визиты → запущенные ресёрчи → оценки (по тем же датам)
     researches = (
@@ -1553,7 +1574,8 @@ async def get_analytics(days: int = 30, db: Session = Depends(get_db)):
         "timeseries": timeseries,
         "top_pages": _top(WebEvent.path),
         "top_sources": sources,
-        "top_referrers": _top(WebEvent.referrer),
+        "top_referrers": _top_non_ai(WebEvent.referrer, is_utm=False),
+        "ai_referral_pageviews": ai_pageviews,
         "devices": _top(WebEvent.device_type, 5),
         "browsers": _top(WebEvent.browser, 6),
         "countries": _top(WebEvent.country, 10),
@@ -1775,6 +1797,37 @@ async def get_bot_crawls(
             for e in events[:100]
         ],
     }
+
+
+@app.get("/api/monitoring/visibility/ai-referrals")
+async def get_ai_referrals(days: int = 30, db: Session = Depends(get_db)):
+    """
+    GEO: визиты людей, пришедших по ссылке из ответа нейросети
+    (utm_source=chatgpt.com / Referer perplexity.ai, claude.ai, gemini…).
+    Для каждого визита: источник, страница входа, путь по сайту, длительность,
+    устройство, язык/часовой пояс. Текст запроса нейросети не передают.
+    """
+    days = max(1, min(days, 365))
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    cols = (
+        WebEvent.created_at, WebEvent.path, WebEvent.referrer, WebEvent.utm_source,
+        WebEvent.utm_medium, WebEvent.utm_campaign, WebEvent.session_id, WebEvent.visitor_id,
+        WebEvent.device_type, WebEvent.browser, WebEvent.os, WebEvent.locale,
+        WebEvent.timezone, WebEvent.country, WebEvent.locale_url,
+    )
+    rows = (
+        db.query(*cols)
+        .filter(WebEvent.created_at >= cutoff, WebEvent.event_type == "pageview")
+        .order_by(WebEvent.created_at.asc())
+        .limit(50000)
+        .all()
+    )
+    events = [{c.key: v for c, v in zip(cols, r)} for r in rows]
+    result = build_ai_referrals(events)
+    result["period_days"] = days
+    result["events_scanned"] = len(events)
+    result["events_cap_reached"] = len(events) >= 50000
+    return result
 
 
 if __name__ == "__main__":
