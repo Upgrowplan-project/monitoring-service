@@ -1678,9 +1678,10 @@ async def ingest_bot_crawl(payload: dict, db: Session = Depends(get_db)):
 
 # Статьи блога с датами публикации (для расчёта time-to-first-crawl)
 _BLOG_POSTS = {
-    "/blog/milan-coffee-shop-market-2026":                          "2026-07-26",
-    "/blog/financial-stress-test-5-metrics":                       "2026-07-26",
+    "/blog/opening-coffee-shop-milan-2026-competition":            "2026-07-22",
+    "/blog/entrepreneur-rose-tinted-glasses-5-stress-test-metrics": "2026-06-15",
     "/blog/online-english-school-market-2026-competitor-analysis":  "2026-08-14",
+    "/blog/ai-business-plan-generator-market-research-2026":        "2026-09-30",
 }
 
 
@@ -1745,15 +1746,18 @@ async def get_bot_crawls(
         if path not in crawled_paths:
             pub_dt = datetime.strptime(pub, "%Y-%m-%d")
             age_days = (datetime.utcnow() - pub_dt).days
-            if age_days >= 7:
-                recommendations.append({
-                    "type": "not_crawled",
-                    "severity": "warning" if age_days < 30 else "critical",
-                    "path": path,
-                    "published_at": pub,
-                    "age_days": age_days,
-                    "action": "Submit to Bing IndexNow and share on LinkedIn to attract AI-bot discovery.",
-                })
+            recommendations.append({
+                "type": "not_crawled",
+                "severity": "info" if age_days < 7 else "warning" if age_days < 30 else "critical",
+                "path": path,
+                "published_at": pub,
+                "age_days": age_days,
+                "action": (
+                    "New article — allow up to 7 days for AI-bot discovery; if it remains uncrawled, submit it via Bing IndexNow and add inbound links."
+                    if age_days < 7
+                    else "Submit to Bing IndexNow and share on LinkedIn to attract AI-bot discovery."
+                ),
+            })
         else:
             info = page_map[path]
             if info["days_to_first_crawl"] is not None and info["days_to_first_crawl"] > 14:
