@@ -28,6 +28,7 @@ from monitoring.ai_referrals import classify_ai_source, build_ai_referrals
 from monitoring.ratings_api import router as ratings_router
 from monitoring import auth as mon_auth
 from monitoring.contact_guard import ContactIn, contact_limiter, client_ip, html_escape_name
+from monitoring.brevo_mailer import send_brevo_email
 from fastapi.responses import JSONResponse
 
 # Настройка логирования
@@ -753,20 +754,16 @@ async def post_contact(payload: ContactIn, request: Request, db: Session = Depen
         sent = False
         if brevo_key:
             try:
-                import httpx as _httpx
-                resp = _httpx.post(
-                    "https://api.brevo.com/v3/smtp/email",
-                    headers={"api-key": brevo_key, "Content-Type": "application/json"},
-                    json={
+                send_brevo_email(
+                    brevo_key,
+                    {
                         "sender": {"name": "Upgrowplan", "email": from_email},
                         "to": [{"email": to_email}],
                         "replyTo": {"email": email_addr},
                         "subject": subject,
                         "textContent": body_text,
                     },
-                    timeout=15,
                 )
-                resp.raise_for_status()
                 sent = True
                 logger.info(f"Email sent via Brevo API to {to_email}")
             except Exception as e:
@@ -818,18 +815,15 @@ async def post_contact(payload: ContactIn, request: Request, db: Session = Depen
 
         if brevo_key and email_addr:
             try:
-                import httpx as _httpx
-                _httpx.post(
-                    "https://api.brevo.com/v3/smtp/email",
-                    headers={"api-key": brevo_key, "Content-Type": "application/json"},
-                    json={
+                send_brevo_email(
+                    brevo_key,
+                    {
                         "sender": {"name": "Upgrowplan Team", "email": from_email},
                         "to": [{"email": email_addr}],
                         "subject": auto_reply_subject,
                         "htmlContent": auto_reply_html,
                         "textContent": auto_reply_text,
                     },
-                    timeout=15,
                 )
                 logger.info(f"Auto-reply sent to {email_addr}")
             except Exception as e:
