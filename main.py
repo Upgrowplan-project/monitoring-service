@@ -1,5 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func, text
 from datetime import datetime, timedelta
@@ -73,6 +74,10 @@ async def _auth_dispatch(request, call_next):
 
 app.add_middleware(BaseHTTPMiddleware, dispatch=_auth_dispatch)
 mon_auth.startup_check()  # fail-closed: без секретов — 503, не открытые данные
+
+
+class UserStatusUpdate(BaseModel):
+    active: bool
 
 # CORS middleware
 app.add_middleware(
@@ -1567,6 +1572,72 @@ async def get_user_stats():
     except Exception as e:
         logger.error(f"Error fetching user-service stats: {e}")
         return {"configured": True, "error": str(e)}
+
+
+async def _proxy_admin_user_service(
+    request: Request,
+    method: str,
+    path: str,
+    *,
+    params: dict | None = None,
+    json_body: dict | None = None,
+):
+    base = (config.USER_SERVICE_URL or "").rstrip("/")
+    if not base:
+        raise HTTPException(status_code=503, detail="user-service is not configured")
+    authorization = request.headers.get("authorization")
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing admin token")
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.request(
+                method,
+                f"{base}{path}",
+                params=params,
+                json=json_body,
+                headers={"Authorization": authorization},
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"detail": "Invalid response from user-service"}
+        if response.status_code >= 400:
+            return JSONResponse(status_code=response.status_code, content=payload)
+        return payload
+    except httpx.RequestError as e:
+        logger.error("User-service admin request failed: %s", e)
+        raise HTTPException(status_code=502, detail="user-service request failed") from e
+
+
+@app.get("/api/monitoring/users")
+async def list_registered_users(
+    request: Request,
+    page: int = 0,
+    size: int = 25,
+    search: str = "",
+):
+    return await _proxy_admin_user_service(
+        request,
+        "GET",
+        "/api/admin/users",
+        params={"page": page, "size": size, "search": search},
+    )
+
+
+@app.put("/api/monitoring/users/{user_id}/status")
+async def update_registered_user_status(
+    user_id: int,
+    payload: UserStatusUpdate,
+    request: Request,
+):
+    return await _proxy_admin_user_service(
+        request,
+        "PUT",
+        f"/api/admin/users/{user_id}/status",
+        json_body=payload.model_dump(),
+    )
 
 
 # ============================================================
