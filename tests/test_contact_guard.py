@@ -16,6 +16,17 @@ def test_valid_contact_normalizes():
     assert c.name == "Ann" and c.email == "ann@example.com"
 
 
+@pytest.mark.parametrize("locale", ["en", "ru"])
+def test_contact_locale_is_accepted(locale):
+    c = cg.ContactIn(email="a@example.com", message="hi", locale=locale)
+    assert c.locale == locale
+
+
+def test_unknown_contact_locale_is_rejected():
+    with pytest.raises(ValidationError):
+        cg.ContactIn(email="a@example.com", message="hi", locale="fr")
+
+
 @pytest.mark.parametrize("email", ["", "x", "a@b", "a b@c.io", "a@b.c", "<x>@y.io", "a@b.io\r\nBcc: z@q.io", "a" * 260 + "@x.io"])
 def test_bad_email_rejected(email):
     with pytest.raises(ValidationError):

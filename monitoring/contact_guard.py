@@ -13,7 +13,7 @@ import re
 import threading
 import time
 from collections import deque
-from typing import Deque, Dict
+from typing import Deque, Dict, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -26,6 +26,7 @@ class ContactIn(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     email: str = Field(min_length=3, max_length=254)
     message: str = Field(min_length=1, max_length=4000)
+    locale: Literal["en", "ru"] | None = None
 
     @field_validator("name")
     @classmethod
