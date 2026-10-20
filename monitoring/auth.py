@@ -84,6 +84,21 @@ def _verify_admin_token(token: str) -> tuple[bool, bool]:
     return role == "ADMIN", False
 
 
+def decode_user_identity(token: str) -> tuple[Optional[str], Optional[str], bool]:
+    """Return (email, role, expired) for a valid site JWT."""
+    secret = os.getenv("JWT_SECRET")
+    if not secret:
+        return None, None, False
+    import jwt
+    try:
+        payload = jwt.decode(token, secret, algorithms=["HS512"], options={"verify_aud": False})
+        return payload.get("sub"), (payload.get("role") or "USER").upper(), False
+    except jwt.ExpiredSignatureError:
+        return None, None, True
+    except Exception:
+        return None, None, False
+
+
 def check_request(method: str, path: str, authorization: Optional[str], ingest_token: Optional[str]):
     """
     Возвращает None если запрос разрешён, иначе (status_code, message).
@@ -109,6 +124,33 @@ def check_request(method: str, path: str, authorization: Optional[str], ingest_t
             return (503, "Ingest token not configured")  # fail-closed
         if not ingest_token or not hmac.compare_digest(ingest_token, expected):
             return (401, "Invalid ingest token")
+        return None
+
+    is_artifact_ingest = method == "POST" and path.startswith("/api/monitoring/reports/") and path.endswith("/artifact")
+    if is_artifact_ingest:
+        expected = os.getenv("MONITORING_INGEST_TOKEN")
+        if not expected:
+            return (503, "Ingest token not configured")
+        if not ingest_token or not hmac.compare_digest(ingest_token, expected):
+            return (401, "Invalid ingest token")
+        return None
+
+    # Site accounts may read only their own reports through these endpoints.
+    is_owner_read = method == "GET" and (
+        path == "/api/monitoring/my-reports"
+        or (path.startswith("/api/monitoring/my-reports/") and path.count("/") == 4)
+        or (path.startswith("/api/monitoring/my-reports/") and path.count("/") == 5 and path.endswith("/artifact"))
+    )
+    if is_owner_read:
+        if not os.getenv("JWT_SECRET"):
+            return (503, "Auth not configured")
+        if not authorization or not authorization.startswith("Bearer "):
+            return (401, "Missing user token")
+        email, role, expired = decode_user_identity(authorization[7:].strip())
+        if expired:
+            return (401, "Token expired")
+        if not email or role not in {"ADMIN", "MANAGER", "USER", "BETA_TESTER"}:
+            return (403, "Valid site user required")
         return None
 
     # Остальное под /api/monitoring и /api/ratings — только ADMIN.

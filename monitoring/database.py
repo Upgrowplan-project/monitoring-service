@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import StaticPool
 from contextlib import contextmanager
@@ -29,6 +29,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Инициализация базы данных - создание всех таблиц"""
     Base.metadata.create_all(bind=engine)
+    # create_all does not add columns to an existing production table.
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS owner_user_id BIGINT"))
+            connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS owner_email VARCHAR(320)"))
+            connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS artifact_docx BYTEA"))
+            connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS artifact_filename VARCHAR(512)"))
+            connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS artifact_mime_type VARCHAR(150)"))
 
 
 def get_db() -> Session:

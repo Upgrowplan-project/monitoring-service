@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, Float, Boolean, JSON, Text
+from sqlalchemy import Column, String, Integer, BigInteger, DateTime, Float, Boolean, JSON, Text, LargeBinary
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 
@@ -205,6 +205,11 @@ class ResearchReport(Base):
     id = Column(Integer, primary_key=True, index=True)
     research_id = Column(String(255), unique=True, nullable=False, index=True)
     service_name = Column(String(100), nullable=True, index=True, default="market-research-service")
+    owner_user_id = Column(BigInteger, nullable=True, index=True)
+    owner_email = Column(String(320), nullable=True, index=True)
+    artifact_docx = Column(LargeBinary, nullable=True)
+    artifact_filename = Column(String(512), nullable=True)
+    artifact_mime_type = Column(String(150), nullable=True)
 
     # Краткие поля запроса (для списка/фильтра без парсинга JSON)
     product_name = Column(String(512), nullable=True)
