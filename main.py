@@ -1756,43 +1756,18 @@ async def update_registered_user_status(
     )
 
 
-def _send_beta_or_account_invite(email: str, invite_url: str, locale: str, role: str, beta: bool) -> bool:
-    """Send a one-time account/beta link through the configured Brevo + Fixie path."""
-    cfg = get_config()
-    api_key = (cfg.BREVO_API_KEY or "").strip()
-    if not api_key or not invite_url:
-        return False
-    from html import escape
-    lang = "ru" if (locale or "").lower().startswith("ru") else "en"
-    beta_expiry_days = 14 if "/market-research/accept" in invite_url else 7
-    safe_url = escape(invite_url, quote=True)
-    if lang == "ru":
-        subject = "Приглашение в Upgrowplan — доступ к Market Research" if beta else "Создайте аккаунт Upgrowplan"
-        title = "Приглашение в Market Research beta" if beta else "Ваш аккаунт Upgrowplan готов"
-        description = f"Ссылка дает доступ к двум запускам Market Research и действует {beta_expiry_days} дней." if beta else "Откройте ссылку, чтобы подтвердить email и войти в аккаунт. Ссылка действует 7 дней."
-        button = "Открыть Upgrowplan"
-    else:
-        subject = "Upgrowplan invitation — Market Research beta" if beta else "Set up your Upgrowplan account"
-        title = "You’re invited to the Market Research beta" if beta else "Your Upgrowplan account is ready"
-        description = f"This link gives you two Market Research runs and expires in {beta_expiry_days} days." if beta else "Open the link to verify your email and sign in. The link expires in 7 days."
-        button = "Open Upgrowplan"
-    body = (
-        '<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#243447">'
-        f'<h2>{escape(title)}</h2><p>{escape(description)}</p>'
-        f'<p><a href="{safe_url}" style="display:inline-block;background:#176b83;color:white;padding:12px 20px;border-radius:6px;text-decoration:none">{escape(button)}</a></p>'
-        f'<p style="font-size:12px;color:#667085">{safe_url}</p></div>'
-    )
-    try:
-        send_brevo_email(api_key, {
-            "sender": {"name": "Upgrowplan", "email": cfg.SMTP_FROM_EMAIL or "info@upgrowplan.com"},
-            "to": [{"email": email}],
-            "subject": subject,
-            "htmlContent": body,
-        })
-        return True
-    except Exception as exc:
-        logger.warning("Could not send account invite to %s via Brevo: %s", email, exc)
-        return False
+def _send_beta_or_account_invite(email: str, invite_url: str, locale: str, role: str, beta: bool) -> str:
+    """Send a one-time account/beta link (Resend; Brevo when Resend is not set or refuses). Returns the path taken —
+    "resend" / "brevo" / "brevo-fallback" — or "" when nothing was sent."""
+    if not email or not invite_url:
+        return ""
+    from monitoring.invite_email import build_invite_email
+    from monitoring.link_mailer import send_link_email
+    via = send_link_email(email, lambda direct: build_invite_email(invite_url, locale, beta, direct),
+                          "beta-invite" if beta else "account-invite")
+    if not via:
+        logger.warning("Could not send account invite to %s", email)
+    return via
 
 
 @app.post("/api/monitoring/users")
@@ -1808,8 +1783,8 @@ async def create_or_assign_registered_user(request: Request, payload: dict):
         payload.get("locale", "en"),
         user.get("role") or payload.get("role", "USER"),
         (user.get("role") or payload.get("role", "USER")) == "BETA_TESTER",
-    ) if invite_url else False
-    return {**result, "emailSent": sent}
+    ) if invite_url else ""
+    return {**result, "emailSent": bool(sent), "emailVia": sent}
 
 
 @app.put("/api/monitoring/users/{user_id}/role")
@@ -1833,7 +1808,36 @@ async def create_market_research_beta_invite(request: Request, payload: dict):
         "BETA_TESTER",
         True,
     )
-    return {**result, "emailSent": sent}
+    return {**result, "emailSent": bool(sent), "emailVia": sent}
+
+
+LOGIN_LINK_URL_PREFIX = "https://www.upgrowplan.com/"   # the site's sign-in pages; anything else is refused
+
+
+@app.post("/api/internal/login-link-email")
+async def send_login_link_email(request: Request, payload: dict):
+    """[22.10 · tester locked out on his computer after the one-time invite was used on the phone] User service has no
+    mail path on Heroku; it asks Monitoring to email a self-service sign-in link. Server-to-server: X-Internal-Token ==
+    USER_SERVICE_MAIL_TOKEN (unset → 503, fail-closed); only links to our site are sent (not an open mail relay)."""
+    import hmac
+    expected = (get_config().USER_SERVICE_MAIL_TOKEN or "").strip()
+    if not expected:
+        return JSONResponse(status_code=503, content={"detail": "login-link mail is not configured"})
+    given = request.headers.get("X-Internal-Token") or ""
+    if not hmac.compare_digest(given, expected):
+        return JSONResponse(status_code=403, content={"detail": "forbidden"})
+    email = str(payload.get("email") or "").strip()
+    url = str(payload.get("url") or "")
+    if not email or "@" not in email or not url.startswith(LOGIN_LINK_URL_PREFIX):
+        return JSONResponse(status_code=400, content={"detail": "email and a site link are required"})
+    minutes = int(payload.get("minutes") or 30)
+    from monitoring.invite_email import build_login_link_email
+    from monitoring.link_mailer import send_link_email
+    via = send_link_email(email, lambda direct: build_login_link_email(url, str(payload.get("locale") or "en"), minutes, direct),
+                          "login-link")
+    if not via:
+        return JSONResponse(status_code=502, content={"detail": "email not sent"})
+    return {"emailSent": True, "emailVia": via}
 
 
 # ============================================================

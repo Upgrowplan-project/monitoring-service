@@ -63,6 +63,11 @@ class MonitoringConfig(BaseSettings):
     SMTP_FROM_EMAIL: Optional[str] = None  # отображаемый From-адрес (info@upgrowplan.com)
     BREVO_API_KEY: Optional[str] = None    # REST API key (xkeysib-...), отдельно от SMTP key
     FIXIE_URL: Optional[str] = None        # HTTP proxy for Brevo API requests (Heroku Fixie)
+    # [22.10] one-time sign-in links (invites, login links) go through Resend: no click/open tracking by default, so the
+    # button shows the real upgrowplan.com address. Unset → Brevo, as before.
+    RESEND_API_KEY: Optional[str] = None
+    # shared with User service (MONITORING_MAIL_TOKEN there): it asks Monitoring to email a self-service login link
+    USER_SERVICE_MAIL_TOKEN: Optional[str] = None
     
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
