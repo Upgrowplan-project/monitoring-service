@@ -20,6 +20,8 @@ from datetime import datetime
 from typing import Iterable, Optional
 from urllib.parse import urlparse
 
+from .web_analytics_privacy import sanitize_analytics_path, sanitize_analytics_url
+
 # (название, домены реферера, значения utm_source)
 AI_SOURCES: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
     ("ChatGPT", ("chatgpt.com", "chat.openai.com"), ("chatgpt.com", "chatgpt", "chat.openai.com", "openai")),
@@ -96,13 +98,13 @@ def build_ai_referrals(events: Iterable[dict], visit_limit: int = 200) -> dict:
         visits.append({
             "source": classify_ai_source(land.get("utm_source"), land.get("referrer")),
             "started_at": _iso(land["created_at"]),
-            "landing_path": land.get("path"),
-            "landing_url": land.get("locale_url"),
-            "referrer": land.get("referrer"),
+            "landing_path": sanitize_analytics_path(land.get("path")),
+            "landing_url": sanitize_analytics_url(land.get("locale_url")),
+            "referrer": sanitize_analytics_url(land.get("referrer")),
             "utm_source": land.get("utm_source"),
             "utm_medium": land.get("utm_medium"),
             "utm_campaign": land.get("utm_campaign"),
-            "pages": [e.get("path") for e in tail],
+            "pages": [sanitize_analytics_path(e.get("path")) for e in tail],
             "pages_count": len(tail),
             "duration_sec": int((tail[-1]["created_at"] - land["created_at"]).total_seconds()),
             "returning_visitor": bool(vid and first_seen_visitor.get(vid) and first_seen_visitor[vid] < land["created_at"]),

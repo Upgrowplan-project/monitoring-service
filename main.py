@@ -2,7 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPExcept
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func, text
+from sqlalchemy import desc, func, not_, or_, text
 from datetime import datetime, timedelta
 from typing import List, Optional
 import asyncio
@@ -26,6 +26,7 @@ from monitoring import (
 )
 from monitoring.models import GeoCheck, BotCrawlEvent
 from monitoring.ai_referrals import classify_ai_source, build_ai_referrals
+from monitoring.web_analytics_privacy import sanitize_analytics_path, sanitize_analytics_url
 from monitoring.ratings_api import router as ratings_router
 from monitoring import auth as mon_auth
 from monitoring.contact_guard import ContactIn, contact_limiter, client_ip
@@ -1530,8 +1531,8 @@ async def ingest_pageview(payload: dict, request: Request, db: Session = Depends
         row = WebEvent(
             event_type=(payload.get("event_type") or "pageview")[:50],
             event_name=_clip(payload.get("event_name"), 120),
-            path=_clip(payload.get("path"), 1024),
-            referrer=_clip(payload.get("referrer"), 1024),
+            path=_clip(sanitize_analytics_path(payload.get("path")), 1024),
+            referrer=_clip(sanitize_analytics_url(payload.get("referrer")), 1024),
             utm_source=_clip(payload.get("utm_source"), 255),
             utm_medium=_clip(payload.get("utm_medium"), 255),
             utm_campaign=_clip(payload.get("utm_campaign"), 255),
@@ -1545,7 +1546,7 @@ async def ingest_pageview(payload: dict, request: Request, db: Session = Depends
             country=_clip(country, 8),
             ip_hash=_hash_ip(client_ip),
             user_agent=_clip(ua, 1000),
-            locale_url=_clip(payload.get("url"), 1024),
+            locale_url=_clip(sanitize_analytics_url(payload.get("url")), 1024),
         )
         db.add(row)
         db.commit()
@@ -1567,6 +1568,23 @@ async def get_analytics(days: int = 30, db: Session = Depends(get_db)):
         WebEvent.event_type == "pageview",
     )
 
+    # Keep the existing all-route totals for product diagnostics, and expose a
+    # separate public-marketing view for acquisition reporting. This excludes
+    # account/auth/admin/beta routes and the interactive MRS workbench without
+    # dropping any events or changing the beta user journey.
+    marketing_excluded_prefixes = (
+        "/account", "/ru/account", "/auth", "/ru/auth",
+        "/monitoring", "/ru/monitoring", "/api", "/ru/api", "/beta", "/ru/beta",
+        "/fin-model", "/ru/fin-model", "/solutions/marketresearch",
+        "/ru/solutions/marketresearch",
+    )
+    normalized_path = func.lower(WebEvent.path)
+    excluded_path = or_(*[
+        or_(normalized_path == prefix, normalized_path.like(prefix + "/%"))
+        for prefix in marketing_excluded_prefixes
+    ])
+    marketing_base = base.filter(WebEvent.path.isnot(None), not_(excluded_path))
+
     pageviews = base.count()
     unique_visitors = (
         db.query(func.count(func.distinct(WebEvent.visitor_id)))
@@ -1579,16 +1597,52 @@ async def get_analytics(days: int = 30, db: Session = Depends(get_db)):
         .scalar()
     ) or 0
 
-    def _top(column, limit=10):
+    def _top(column, limit=10, query=base):
         rows = (
-            db.query(column, func.count(WebEvent.id).label("c"))
-            .filter(WebEvent.created_at >= cutoff, WebEvent.event_type == "pageview", column.isnot(None))
+            query.with_entities(column, func.count(WebEvent.id).label("c"))
+            .filter(column.isnot(None))
             .group_by(column)
             .order_by(func.count(WebEvent.id).desc())
             .limit(limit)
             .all()
         )
         return [{"key": r[0], "count": int(r[1])} for r in rows]
+
+    def _top_safe_url(query, column, limit=10, path_only=False):
+        rows = (
+            query.with_entities(column, func.count(WebEvent.id).label("c"))
+            .filter(column.isnot(None))
+            .group_by(column)
+            .order_by(func.count(WebEvent.id).desc())
+            .all()
+        )
+        counts = {}
+        for raw_value, count in rows:
+            safe_value = sanitize_analytics_path(raw_value) if path_only else sanitize_analytics_url(raw_value)
+            if safe_value:
+                counts[safe_value] = counts.get(safe_value, 0) + int(count)
+        return [
+            {"key": key, "count": count}
+            for key, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+        ]
+
+    def _totals(query):
+        return {
+            "pageviews": int(query.count()),
+            "unique_visitors": int(query.with_entities(func.count(func.distinct(WebEvent.visitor_id))).scalar() or 0),
+            "sessions": int(query.with_entities(func.count(func.distinct(WebEvent.session_id))).scalar() or 0),
+        }
+
+    marketing_ts_rows = (
+        marketing_base.with_entities(
+            func.date(WebEvent.created_at).label("d"),
+            func.count(WebEvent.id).label("views"),
+            func.count(func.distinct(WebEvent.visitor_id)).label("visitors"),
+        )
+        .group_by(func.date(WebEvent.created_at))
+        .order_by(func.date(WebEvent.created_at))
+        .all()
+    )
 
     # Таймсерия по дням (через date())
     ts_rows = (
@@ -1620,7 +1674,7 @@ async def get_analytics(days: int = 30, db: Session = Depends(get_db)):
     ai_pageviews = sum(1 for u, r in attributed if classify_ai_source(u, r))
 
     def _top_non_ai(column, is_utm: bool, limit=10):
-        rows = _top(column, limit=limit + 30)
+        rows = _top(column, limit=limit + 30, query=base)
         keep = [
             r for r in rows
             if not (classify_ai_source(r["key"], None) if is_utm else classify_ai_source(None, r["key"]))
@@ -1649,13 +1703,25 @@ async def get_analytics(days: int = 30, db: Session = Depends(get_db)):
             "sessions": int(sessions),
         },
         "timeseries": timeseries,
-        "top_pages": _top(WebEvent.path),
+        "top_pages": _top_safe_url(base, WebEvent.path, path_only=True),
         "top_sources": sources,
-        "top_referrers": _top_non_ai(WebEvent.referrer, is_utm=False),
+        "top_referrers": [
+            item for item in _top_safe_url(base, WebEvent.referrer)
+            if not classify_ai_source(None, item["key"])
+        ],
+        "marketing": {
+            "totals": _totals(marketing_base),
+            "timeseries": [
+                {"date": str(r[0]), "views": int(r[1]), "visitors": int(r[2])}
+                for r in marketing_ts_rows
+            ],
+            "top_pages": _top_safe_url(marketing_base, WebEvent.path, path_only=True),
+            "excluded_route_groups": ["account", "auth", "monitoring", "api", "beta", "fin-model", "MRS workbench"],
+        },
         "ai_referral_pageviews": ai_pageviews,
-        "devices": _top(WebEvent.device_type, 5),
-        "browsers": _top(WebEvent.browser, 6),
-        "countries": _top(WebEvent.country, 10),
+        "devices": _top(WebEvent.device_type, 5, query=base),
+        "browsers": _top(WebEvent.browser, 6, query=base),
+        "countries": _top(WebEvent.country, 10, query=base),
         "funnel": {
             "visitors": int(unique_visitors),
             "sessions": int(sessions),
