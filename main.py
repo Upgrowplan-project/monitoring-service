@@ -980,8 +980,9 @@ async def trigger_health_check(db: Session = Depends(get_db)):
     Триггер немедленной проверки всех сервисов
     """
     try:
-        results = await check_all_services(config)
-        
+        # runs inside this HTTP request (Heroku cuts it at 30 s) — no wake-up retry here
+        results = await check_all_services(config, wake_retry_delay=0)
+
         # Сохраняем результаты
         for result in results:
             health_record = ServiceHealth(

@@ -284,6 +284,30 @@ class HealthChecker:
         url: str,
         health_path: str = "/health",
         up_on_any_response: bool = False,
+        wake_retry_delay: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        [28.10 · owner «4»] Heroku eco dynos sleep; while one wakes (~25–30 s) the router answers 503 (H99) and the
+        check raised «CRITICAL: Service is down: HTTP 503» four times on 24.10 for a Deep Research Agent that was fine
+        (the next request got 200). A «down» result (5xx / timeout / connection error) is checked once more after
+        wake_retry_delay seconds; only a second «down» is reported. 0 = no retry (the manual check-now endpoint runs
+        inside an HTTP request that Heroku cuts at 30 s).
+        """
+        result = await HealthChecker._check_http_service_once(name, url, health_path, up_on_any_response)
+        if result["status"] != "down" or wake_retry_delay <= 0:
+            return result
+        logger.info(f"[HEALTH] {name}: {result.get('error_message')} — retrying in {wake_retry_delay:.0f}s (may be waking up)")
+        await asyncio.sleep(wake_retry_delay)
+        retried = await HealthChecker._check_http_service_once(name, url, health_path, up_on_any_response)
+        retried.setdefault("metadata", {})["first_attempt"] = result.get("error_message")
+        return retried
+
+    @staticmethod
+    async def _check_http_service_once(
+        name: str,
+        url: str,
+        health_path: str = "/health",
+        up_on_any_response: bool = False,
     ) -> Dict[str, Any]:
         """
         Проверка готовности бэкенд-сервиса через его HTTP /health эндпоинт.
@@ -514,13 +538,14 @@ class HealthChecker:
             return {"status": "down", "error_message": str(e)}
 
 
-async def check_all_services(config) -> list:
+async def check_all_services(config, wake_retry_delay: float = 10.0) -> list:
     """
     Проверяет все сервисы параллельно
-    
+
     Args:
         config: MonitoringConfig instance
-        
+        wake_retry_delay: пауза перед повторной проверкой «упавшего» бэкенда (просыпается после сна); 0 — без повтора
+
     Returns:
         Список результатов проверки всех сервисов
     """
@@ -561,6 +586,7 @@ async def check_all_services(config) -> list:
                 svc["url"],
                 svc.get("health_path", "/health"),
                 up_on_any_response=_liveness,
+                wake_retry_delay=wake_retry_delay,
             ),
             "service_name": svc_name,
             "service_type": "service",
