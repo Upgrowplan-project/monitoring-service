@@ -413,6 +413,13 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
     def is_error(row: GeoCheck) -> bool:
         return (row.excerpt or "").startswith("[ERROR:") or (row.response_text or "").startswith("[ERROR:")
 
+    # [29.10 · owner «5»] a question that names the brand («Что такое Upgrowplan?») is «mentioned» by any answer,
+    # even «no such service is known» — such rows are flagged and kept out of the mention share
+    brand = (getattr(get_config(), "GEO_BRAND", "upgrowplan") or "upgrowplan").lower()
+
+    def brand_in_query(row: GeoCheck) -> bool:
+        return brand in (row.query or "").lower()
+
     visible_rows = [row for row in rows if not is_error(row)]
     error_rows = [row for row in rows if is_error(row)]
     items = [
@@ -420,6 +427,7 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
             "id": r.id,
             "llm": r.llm,
             "query": r.query,
+            "brand_in_query": brand_in_query(r),
             "mentioned": r.mentioned,
             "position": r.position,
             "excerpt": r.excerpt,
@@ -440,11 +448,16 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
     ]
     # Сводка по LLM — error-записи не учитываются в проценте
     from collections import defaultdict
-    summary: dict = defaultdict(lambda: {"total": 0, "mentioned": 0, "errors": 0, "last_check": None})
+    summary: dict = defaultdict(lambda: {"total": 0, "mentioned": 0, "errors": 0, "last_check": None,
+                                         "brand_query_total": 0, "brand_query_mentioned": 0})
     for r in rows:
         s = summary[r.llm]
         if is_error(r):
             s["errors"] += 1
+        elif brand_in_query(r):
+            s["brand_query_total"] += 1
+            if r.mentioned:
+                s["brand_query_mentioned"] += 1
         else:
             s["total"] += 1
             if r.mentioned:
@@ -458,7 +471,8 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
 async def geo_scan_now(background_tasks: BackgroundTasks):
     """Запускает GEO-скан в фоне, сразу возвращает ответ (Heroku H12 prevention)."""
     from monitoring.tasks import geo_visibility_task
-    background_tasks.add_task(geo_visibility_task)
+    # the button scans even if the automatic daily scan already ran
+    background_tasks.add_task(geo_visibility_task, force=True)
     return {"status": "started", "message": "Скан запущен в фоне (~60–90 сек). Данные появятся после завершения."}
 
 

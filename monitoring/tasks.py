@@ -2,6 +2,7 @@ from celery import Celery
 from celery.schedules import crontab
 from datetime import datetime
 import logging
+import os
 from .config import get_config
 from .database import get_db_session
 from .models import ServiceHealth, SystemAlert, UserActivity, GeoCheck
@@ -679,11 +680,62 @@ def _extract_mention(text: str, brand: str = "upgrowplan") -> dict:
     return {"mentioned": True, "position": pos, "excerpt": text[s:e]}
 
 
+def _gemini_model() -> str:
+    # [29.10 · owner «1»] the alias gemini-flash-latest silently moved to gemini-3.8-flash: a «thinking» model with a
+    # free-tier limit of 20 requests a day (Google 429: GenerateRequestsPerDayPerProjectPerModel-FreeTier, limit 20) —
+    # no successful GEO answer since 25.10. A pinned model keeps the measurement comparable day to day; a non-thinking
+    # Flash-Lite answers in ~3 s (measured 29.10). Env GEO_GEMINI_MODEL switches it without a code change.
+    return (os.getenv("GEO_GEMINI_MODEL") or "gemini-3.5-flash-lite").strip()
+
+
 def _get_gemini_url() -> str:
-    # Google keeps this alias on the current Flash release, avoiding retired
-    # version-specific endpoints such as gemini-2.0-flash.
-    model = "gemini-flash-latest"
-    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{_gemini_model()}:generateContent"
+
+
+# Daily request quotas reset at midnight Pacific time (Gemini API rate-limit docs).
+def _pacific_day_start_utc():
+    import datetime as dt
+    now = dt.datetime.now(dt.timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        local = now.astimezone(ZoneInfo("America/Los_Angeles"))
+    except Exception:
+        local = now.astimezone(dt.timezone(dt.timedelta(hours=-8)))
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
+def _geo_quota_info(body: str) -> dict:
+    """quotaId / limit / retry delay from a Gemini 429 body (JSON); empty values when unreadable."""
+    import json as _json
+    info = {"quota_id": "", "limit": None, "retry_s": None}
+    try:
+        err = _json.loads(body).get("error", {})
+    except Exception:
+        return info
+    for det in err.get("details", []) or []:
+        for v in det.get("violations", []) or []:
+            info["quota_id"] = info["quota_id"] or str(v.get("quotaId") or "")
+            info["limit"] = info["limit"] or v.get("quotaValue")
+        delay = det.get("retryDelay")
+        if delay and str(delay).rstrip("s").replace(".", "", 1).isdigit():
+            info["retry_s"] = float(str(delay).rstrip("s"))
+    return info
+
+
+def _geo_auto_scan_done_today(n_queries: int) -> bool:
+    """[29.10 · owner «2»] the in-process scheduler starts on every wake of the eco dyno, so «once a day» became a full
+    scan on every wake (30–65 rows a day for 12 queries). Today's (Pacific day) automatic rows decide: a successful
+    answer, a daily-quota refusal or two scans' worth of rows → no more automatic scans today."""
+    since = _pacific_day_start_utc()
+    with get_db_session() as db:
+        rows = db.query(GeoCheck.response_text).filter(GeoCheck.auto.is_(True), GeoCheck.created_at >= since).all()
+    texts = [r[0] or "" for r in rows]
+    if any(not t.startswith("[ERROR") for t in texts):
+        return True
+    if any(t.startswith("[ERROR: quota_exceeded]") for t in texts):
+        return True
+    return len(texts) >= 2 * n_queries
 
 # Предотвращаем параллельные запуски скана
 _geo_scan_running = False
@@ -702,7 +754,8 @@ def _gemini_post(api_key: str, prompt: str) -> str:
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    # [29.10 · «4»] 30 s cut «thinking» answers short ("The read operation timed out" — 16 of 30 rows on 28.10)
+    with urllib.request.urlopen(req, timeout=60) as resp:
         data = _json.loads(resp.read())
     candidates = data.get("candidates", [])
     if not candidates:
@@ -710,10 +763,8 @@ def _gemini_post(api_key: str, prompt: str) -> str:
     return candidates[0]["content"]["parts"][0]["text"]
 
 
-def geo_visibility_task():
-    import time
-    import datetime as dt
-    import urllib.error
+def geo_visibility_task(force: bool = False):
+    """Automatic GEO scan (scheduler) — at most once a Pacific day; force=True (the «scan now» button) skips that check."""
     global _geo_scan_running
 
     if _geo_scan_running:
@@ -722,12 +773,12 @@ def geo_visibility_task():
 
     _geo_scan_running = True
     try:
-        return _geo_visibility_task_impl()
+        return _geo_visibility_task_impl(force)
     finally:
         _geo_scan_running = False
 
 
-def _geo_visibility_task_impl():
+def _geo_visibility_task_impl(force: bool = False):
     import time
     import datetime as dt
     import urllib.error
@@ -752,10 +803,14 @@ def _geo_visibility_task_impl():
         for query_variant in (query, GEO_QUERY_EN_DUPLICATES.get(query))
         if query_variant
     ]
+    model = _gemini_model()
     logger.info(
         f"[GEO] day_group={day_group}, base queries {start}-{start+5}, "
-        f"submitted={len(queries)}"
+        f"submitted={len(queries)}, model={model}, force={force}"
     )
+    if not force and _geo_auto_scan_done_today(len(queries)):
+        logger.info("[GEO] automatic scan already done today (Pacific day) — skipping")
+        return {"status": "skipped", "reason": "already scanned today"}
 
     rows = []
     errors = []
@@ -766,6 +821,7 @@ def _geo_visibility_task_impl():
             break
         success = False
         error_reason = None
+        retried_5xx = False
         for attempt in range(3):
             try:
                 text = _gemini_post(api_key, query)
@@ -783,22 +839,36 @@ def _geo_visibility_task_impl():
                 success = True
                 break
             except urllib.error.HTTPError as e:
-                body = e.read().decode("utf-8", errors="replace")[:300]
+                body = e.read().decode("utf-8", errors="replace")
                 if e.code == 429:
-                    if attempt < 2:
-                        wait = (attempt + 1) * 15
-                        logger.warning(f"[GEO] 429 rate limit, waiting {wait}s (attempt {attempt+1})...")
-                        time.sleep(wait)
-                    else:
-                        logger.error(f"[GEO] quota exhausted after 3 retries, aborting scan")
-                        error_reason = "[ERROR: quota_exceeded] Дневной лимит Gemini исчерпан"
-                        errors.append("Gemini quota exhausted (daily limit). Try again tomorrow.")
+                    # [29.10 · «3»] every 429 used to be «daily limit» after 2 more paid attempts; Google says which
+                    # quota it is — a daily one stops the scan at once, a per-minute one waits as Google asks
+                    q = _geo_quota_info(body)
+                    if "PerDay" in q["quota_id"]:
+                        error_reason = (f"[ERROR: quota_exceeded] Суточный лимит Gemini исчерпан: {model}, "
+                                        f"{q['limit'] or '?'} запросов в сутки; сброс в полночь по тихоокеанскому времени")
+                        logger.error(f"[GEO] daily quota exhausted ({q['quota_id']}, limit {q['limit']}), aborting scan")
+                        errors.append(f"Gemini daily quota exhausted: {model}, limit {q['limit']}")
                         quota_exceeded = True
-                else:
-                    error_reason = f"[ERROR: http_{e.code}] {body[:100]}"
-                    logger.error(f"[GEO] '{query[:40]}': HTTP {e.code}")
-                    errors.append(f"'{query[:40]}': HTTP {e.code}")
+                        break
+                    if attempt < 2:
+                        wait = min(q["retry_s"] or 20.0, 60.0)
+                        logger.warning(f"[GEO] 429 {q['quota_id'] or 'rate limit'}, waiting {wait:.0f}s (attempt {attempt+1})")
+                        time.sleep(wait)
+                        continue
+                    error_reason = f"[ERROR: rate_limited] Минутный лимит Gemini ({q['quota_id'] or 'нет данных'})"
+                    errors.append(f"'{query[:40]}': rate limited")
                     break
+                if e.code in (500, 502, 503, 504) and not retried_5xx:
+                    # [29.10 · «4»] «model is experiencing high demand» — one more try after a pause
+                    retried_5xx = True
+                    logger.warning(f"[GEO] '{query[:40]}': HTTP {e.code}, retrying in 20s")
+                    time.sleep(20)
+                    continue
+                error_reason = f"[ERROR: http_{e.code}] {body[:100]}"
+                logger.error(f"[GEO] '{query[:40]}': HTTP {e.code}")
+                errors.append(f"'{query[:40]}': HTTP {e.code}")
+                break
             except Exception as e:
                 error_reason = f"[ERROR: exception] {str(e)[:100]}"
                 logger.error(f"[GEO] '{query[:40]}': {e}")
