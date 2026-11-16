@@ -26,7 +26,7 @@ def _admin_jwt(role="ADMIN", secret=SECRET, exp_delta=3600):
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for k in ("JWT_SECRET", "MONITORING_INGEST_TOKEN", "MONITORING_AUTH_DISABLED"):
+    for k in ("JWT_SECRET", "MONITORING_INGEST_TOKEN", "MONITORING_AUTH_DISABLED", "MONITORING_READ_TOKEN"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -80,3 +80,48 @@ def test_configured_ingest_token_compare(monkeypatch):
     assert auth.check_request("POST", "/api/monitoring/reports", None, "ingest-secret") is None
     assert auth.check_request("POST", "/api/monitoring/reports", None, "ingest-secreT") == (401, "Invalid ingest token")
     assert auth.check_request("POST", "/api/monitoring/reports", None, None) == (401, "Invalid ingest token")
+
+
+# ── read-only token for the owner's digest agent (15.11) ───────────────────
+def _read(method, path, token="read-secret"):
+    return auth.check_request(method, path, None, None, token)
+
+
+def test_read_token_not_configured_is_503_not_open(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    assert _read("GET", "/api/monitoring/alerts") == (503, "Read token not configured")
+
+
+def test_read_token_opens_allowed_get_paths(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    monkeypatch.setenv("MONITORING_READ_TOKEN", "read-secret")
+    for path in ("/api/monitoring/services", "/api/monitoring/alerts", "/api/monitoring/visibility/summary",
+                 "/api/monitoring/visibility/ai-referrals", "/api/monitoring/geo", "/api/monitoring/stats",
+                 "/api/monitoring/reports", "/api/monitoring/reports/abc-123", "/api/monitoring/emails",
+                 "/api/monitoring/emails/7", "/api/monitoring/service/mrs/history", "/api/ratings/stats"):
+        assert _read("GET", path) is None, path
+
+
+def test_read_token_wrong_value_401(monkeypatch):
+    monkeypatch.setenv("MONITORING_READ_TOKEN", "read-secret")
+    assert _read("GET", "/api/monitoring/alerts", "read-secreT") == (401, "Invalid read token")
+
+
+def test_read_token_cannot_write_or_reach_closed_paths(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    monkeypatch.setenv("MONITORING_READ_TOKEN", "read-secret")
+    denied = (403, "Read token does not allow this request")
+    assert _read("POST", "/api/monitoring/emails/7/reply") == denied
+    assert _read("POST", "/api/monitoring/visibility/scan") == denied
+    assert _read("DELETE", "/api/monitoring/reports/abc") == denied
+    for path in ("/api/monitoring/users", "/api/monitoring/reports/abc/artifact", "/api/monitoring/reports/debug",
+                 "/api/ratings/export", "/api/monitoring/synthesis-logs/sessions", "/api/monitoring/servicesX",
+                 "/api/monitoring/alertsfoo"):
+        assert _read("GET", path) == denied, path
+
+
+def test_read_token_does_not_change_admin_flow(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    monkeypatch.setenv("MONITORING_READ_TOKEN", "read-secret")
+    assert auth.check_request("GET", "/api/monitoring/users", f"Bearer {_admin_jwt()}", None) is None
+    assert auth.check_request("GET", "/api/monitoring/users", None, None) == (401, "Missing admin token")

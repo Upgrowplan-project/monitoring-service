@@ -7,6 +7,9 @@
 - Server-to-server ingest (market-research-service → monitoring): отдельный
   заголовок X-Ingest-Token == MONITORING_INGEST_TOKEN.
 - Публичные эндпоинты (beacon, оценки, контакт-форма) — без авторизации.
+- Read-only для агента-сводки на ноутбуке владельца (15.11 owner «да»): заголовок
+  X-Read-Token == MONITORING_READ_TOKEN, только GET и только READ_TOKEN_PREFIXES —
+  без списка пользователей, DOCX-артефактов, выгрузки оценок, отладки и любых записей.
 
 Fail-closed (аудит 2026-09, P0): если JWT_SECRET / MONITORING_INGEST_TOKEN не заданы,
 охраняемые эндпоинты отвечают 503 — а не открываются. Единственный способ выключить
@@ -37,6 +40,39 @@ INGEST_ENDPOINTS = {
     ("POST", "/api/monitoring/synthesis-logs"),
     ("POST", "/api/monitoring/bot-crawl"),
 }
+
+
+# GET-пути, открытые read-токену. Точное совпадение или префикс с «/» — «/api/monitoring/users»
+# и «/reports/{id}/artifact» сюда не попадают.
+READ_TOKEN_PREFIXES = (
+    "/api/monitoring/overview",
+    "/api/monitoring/services",
+    "/api/monitoring/service/",
+    "/api/monitoring/alerts",
+    "/api/monitoring/visibility",
+    "/api/monitoring/geo",
+    "/api/monitoring/stats",
+    "/api/monitoring/activity",
+    "/api/monitoring/analytics",
+    "/api/monitoring/user-stats",
+    "/api/monitoring/reports",
+    "/api/monitoring/emails",
+    "/api/ratings/stats",
+    "/api/ratings/timeline",
+    "/api/ratings/services",
+)
+
+
+def read_token_allows(path: str) -> bool:
+    if path.startswith("/api/monitoring/reports/") and (path.endswith("/artifact") or path == "/api/monitoring/reports/debug"):
+        return False
+    for p in READ_TOKEN_PREFIXES:
+        if p.endswith("/"):
+            if path.startswith(p):
+                return True
+        elif path == p or path.startswith(p + "/"):
+            return True
+    return False
 
 
 def auth_disabled_explicitly() -> bool:
@@ -99,7 +135,8 @@ def decode_user_identity(token: str) -> tuple[Optional[str], Optional[str], bool
         return None, None, False
 
 
-def check_request(method: str, path: str, authorization: Optional[str], ingest_token: Optional[str]):
+def check_request(method: str, path: str, authorization: Optional[str], ingest_token: Optional[str],
+                  read_token: Optional[str] = None):
     """
     Возвращает None если запрос разрешён, иначе (status_code, message).
     """
@@ -151,6 +188,18 @@ def check_request(method: str, path: str, authorization: Optional[str], ingest_t
             return (401, "Token expired")
         if not email or role not in {"ADMIN", "MANAGER", "USER", "BETA_TESTER"}:
             return (403, "Valid site user required")
+        return None
+
+    # Read-токен решает сам и не проваливается в admin-проверку: запрос с ним либо разрешён,
+    # либо отклонён явно — чтобы агент видел отказ, а не случайный 401 «нет admin-токена».
+    if read_token:
+        expected = os.getenv("MONITORING_READ_TOKEN")
+        if not expected:
+            return (503, "Read token not configured")  # fail-closed
+        if not hmac.compare_digest(read_token, expected):
+            return (401, "Invalid read token")
+        if method != "GET" or not read_token_allows(path):
+            return (403, "Read token does not allow this request")
         return None
 
     # Остальное под /api/monitoring и /api/ratings — только ADMIN.

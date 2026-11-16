@@ -66,6 +66,7 @@ async def _auth_dispatch(request, call_next):
         request.url.path,
         request.headers.get("authorization"),
         request.headers.get("x-ingest-token"),
+        request.headers.get("x-read-token"),
     )
     if verdict is not None:
         code, msg = verdict
