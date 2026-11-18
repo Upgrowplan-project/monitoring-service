@@ -1,14 +1,12 @@
 """[09.11 · бета-тестер 2, прод res_8b35e517416a: 3 × 403 missing_snapshot у сервиса исследований] Страница исследования берёт
 DOCX из Monitoring, когда сервис его уже не отдаёт (запись 4 ч, сон сервера). Маршрут /api/monitoring/my-reports/{id}/artifact:
-владельцу — тот же документ, что сервис прислал по завершении; чужому — 404; без входа — 401. Офлайн, временная SQLite."""
+владельцу — тот же документ, что сервис прислал по завершении; чужому — 404; без входа — 401. Офлайн, временная SQLite
+(адрес базы задаёт tests/conftest.py до сбора тестов; 15.11 — здесь задавался поздно, и запись ушла в рабочую базу)."""
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
-_DB = Path(tempfile.mkdtemp(prefix="mon_art_")) / "t.db"
-os.environ["DATABASE_URL"] = f"sqlite:///{_DB.as_posix()}"
 os.environ["JWT_SECRET"] = "test-secret-my-report-artifact"
 os.environ.setdefault("MONITORING_INGEST_TOKEN", "test-ingest")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

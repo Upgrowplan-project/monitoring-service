@@ -911,3 +911,55 @@ def _geo_visibility_task_impl(force: bool = False):
         "mentions": n_mentions,
         "errors": errors,
     }
+
+
+# [18.11 · владелец п.5 программы 17.11 — «канарейка: DRA извлекает цены, ежедневно на 3 сайтах»] Проверка не «жив ли процесс»,
+# а «делает ли DRA работу цепочки» (monitoring/dra_canary.py). Планировщик будит задачу раз в час (eco-dyno засыпает, суточный
+# интервал мог бы не наступить); сама задача решает по журналу ServiceHealth: сегодня (UTC) уже «healthy» — пропуск; неуспех —
+# повтор не чаще раза в 6 ч (подтвердить сбой / восстановление). Письмо — при смене состояния (AlertManager.should_send_alert).
+DRA_CANARY_RETRY_SECONDS = float(os.getenv("DRA_CANARY_RETRY_SECONDS", str(6 * 3600)))
+
+
+def dra_canary_due(last_status, last_checked, now=None) -> bool:
+    """Чистая функция (гейт): нужна ли проверка сейчас."""
+    now = now or datetime.utcnow()
+    if last_checked is None:
+        return True
+    if last_status == "healthy":
+        return last_checked.date() < now.date()
+    return (now - last_checked).total_seconds() >= DRA_CANARY_RETRY_SECONDS
+
+
+def dra_price_canary_task(force: bool = False, post=None):
+    """[18.11 · п.5] Ежедневная проверка извлечения цен DRA; force=True — вне расписания (ручной запуск)."""
+    import asyncio
+    from . import dra_canary as DC
+    cfg = get_config()
+    try:
+        with get_db_session() as db:
+            prev = db.query(ServiceHealth).filter(ServiceHealth.service_name == DC.SERVICE_NAME) \
+                .order_by(ServiceHealth.last_checked.desc()).first()
+            prev_status, prev_checked = (prev.status, prev.last_checked) if prev else (None, None)
+        if not force and not dra_canary_due(prev_status, prev_checked):
+            return {"status": "skipped", "reason": "already checked", "last": prev_status}
+        res = DC.run(DC.dra_base_url(cfg), post=post)
+        logger.info(f"[DRA-CANARY] {res['status']}: {res['metadata'].get('priced')}/{res['metadata'].get('expected')} pages priced, "
+                    f"{res['metadata'].get('total_facts')} facts, {res['seconds']}s" + (f" — {res['error_message']}" if res.get("error_message") else ""))
+        alert_manager = AlertManager()
+        with get_db_session() as db:
+            db.add(ServiceHealth(service_name=DC.SERVICE_NAME, service_type="canary", status=res["status"],
+                                 response_time=res["seconds"], error_message=res.get("error_message"),
+                                 additional_info=res["metadata"], last_checked=datetime.utcnow()))
+            if alert_manager.should_send_alert(DC.SERVICE_NAME, res["status"], prev_status):
+                msg = ("DRA price extraction recovered: prices extracted from all canary pages" if res["status"] == "healthy"
+                       else f"DRA price extraction {res['status']}: {res.get('error_message')}")
+                alert = SystemAlert(severity=alert_manager.get_alert_severity(res["status"]), service_name=DC.SERVICE_NAME,
+                                    message=msg, created_at=datetime.utcnow())
+                db.add(alert)
+                db.commit()
+                asyncio.run(alert_manager.send_alert(alert))
+            db.commit()
+        return {"status": res["status"], "priced": res["metadata"].get("priced"), "facts": res["metadata"].get("total_facts")}
+    except Exception as e:
+        logger.error(f"[DRA-CANARY] failed: {type(e).__name__}: {e}")
+        return {"status": "error", "message": str(e)}
