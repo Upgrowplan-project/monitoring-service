@@ -61,15 +61,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 
 async def _auth_dispatch(request, call_next):
+    # [20.11 · владелец «адрес базы знаний для разработки»] отдельный ключ ссылки KNOWLEDGE_LINK_KEY открывает ТОЛЬКО чтение
+    # базы знаний (не пароль на чтение: тот открывает и письма, и отчёты); нет ключа в окружении — ссылка не работает
+    if request.method == "GET" and request.url.path.startswith("/api/monitoring/knowledge") \
+            and mon_auth.knowledge_link_ok(request.query_params.get("key")):
+        return await call_next(request)
     verdict = mon_auth.check_request(
         request.method,
         request.url.path,
         request.headers.get("authorization"),
         request.headers.get("x-ingest-token"),
-        # [20.11 · владелец «адрес базы знаний для разработки»] ключ в ссылке (?key=) — только для чтения базы знаний
-        request.headers.get("x-read-token")
-        or (request.query_params.get("key") if request.method == "GET"
-            and request.url.path.startswith("/api/monitoring/knowledge") else None),
+        request.headers.get("x-read-token"),
     )
     if verdict is not None:
         code, msg = verdict

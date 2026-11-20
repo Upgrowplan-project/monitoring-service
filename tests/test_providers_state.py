@@ -159,12 +159,19 @@ def test_endpoints_and_access(monkeypatch):
     lst = c.get("/api/monitoring/knowledge?section=providers", headers=rd).json()
     assert lst["total"] == 1 and lst["entries"][0]["date"] == "2026-11-20"
 
-    md = c.get("/api/monitoring/knowledge.md?key=test-read")
+    monkeypatch.setenv("KNOWLEDGE_LINK_KEY", "kb-link")
+    md = c.get("/api/monitoring/knowledge.md?key=kb-link")
     assert md.status_code == 200 and md.headers["content-type"].startswith("text/markdown")
     assert "## Поставщики и сервисы" in md.text and "**Tavily** — Включена оплата за использование." in md.text
+    assert c.get("/api/monitoring/knowledge.md", headers=rd).status_code == 200      # пароль на чтение — заголовком
     assert c.get("/api/monitoring/knowledge.md").status_code == 401
     assert c.get("/api/monitoring/knowledge.md?key=wrong").status_code == 401
-    assert c.get("/api/monitoring/providers?key=test-read").status_code == 401   # ключ в ссылке — только база знаний
+    assert c.get("/api/monitoring/knowledge.md?key=test-read").status_code == 401    # пароль на чтение в ссылке не работает
+    assert c.get("/api/monitoring/providers?key=kb-link").status_code == 401         # ключ ссылки — только база знаний
+    assert c.get("/api/monitoring/emails?key=kb-link").status_code == 401
+    assert c.post("/api/monitoring/knowledge?key=kb-link", json={"entries": e}).status_code == 401
+    monkeypatch.delenv("KNOWLEDGE_LINK_KEY")
+    assert c.get("/api/monitoring/knowledge.md?key=kb-link").status_code == 401      # нет ключа в окружении — закрыто
 
     assert c.post("/api/monitoring/digests", json={"day": "2026-11-20", "text": "v1"}, headers=ing).status_code == 200
     assert c.post("/api/monitoring/digests", json={"day": "2026-11-20", "text": "v2"}, headers=ing).status_code == 200

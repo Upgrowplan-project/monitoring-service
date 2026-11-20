@@ -81,6 +81,12 @@ def read_token_allows(path: str) -> bool:
     return False
 
 
+def knowledge_link_ok(key: Optional[str]) -> bool:
+    """[20.11] Ключ ссылки на базу знаний (?key=) == KNOWLEDGE_LINK_KEY. Нет переменной — False (fail-closed)."""
+    expected = os.getenv("KNOWLEDGE_LINK_KEY")
+    return bool(expected and key and hmac.compare_digest(key, expected))
+
+
 def auth_disabled_explicitly() -> bool:
     """Авторизация выключена ТОЛЬКО явным флагом (dev). Отсутствие секрета ≠ выключено."""
     return os.getenv("MONITORING_AUTH_DISABLED", "").strip() == "1"
