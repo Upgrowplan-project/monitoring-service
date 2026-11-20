@@ -80,6 +80,7 @@ class InProcessScheduler:
             visibility_scan_task,
             geo_visibility_task,
             dra_price_canary_task,
+            providers_check_task,
         )
 
         health_int = float(os.getenv("HEALTH_CHECK_INTERVAL_SECONDS", "300"))
@@ -92,6 +93,8 @@ class InProcessScheduler:
         geo_int = float(os.getenv("GEO_SCAN_INTERVAL_SECONDS", str(24 * 3600)))
         # [18.11 · п.5] DRA извлекает цены: будим раз в час, сама задача — раз в сутки (журнал ServiceHealth), см. dra_canary_due.
         dra_canary_int = float(os.getenv("DRA_CANARY_TICK_SECONDS", "3600"))
+        # [20.11] остатки поставщиков данных; пока сервис спит — замер при чтении (/api/monitoring/providers)
+        providers_int = float(os.getenv("PROVIDERS_CHECK_INTERVAL_SECONDS", str(6 * 3600)))
 
         loop = asyncio.get_running_loop()
         # Stagger initial delays so the first ticks don't all fire at once.
@@ -117,10 +120,14 @@ class InProcessScheduler:
             loop.create_task(
                 self._run_periodic("dra_price_canary", dra_canary_int, dra_price_canary_task, 300)
             ),
+            loop.create_task(
+                self._run_periodic("providers_check", providers_int, providers_check_task, 90)
+            ),
         ]
         logger.info(
             f"[SCHEDULER] started: health={health_int}s, redis={redis_int}s, "
-            f"email={email_int}s, cleanup={cleanup_int}s, visibility={visibility_int}s, geo={geo_int}s, dra_canary={dra_canary_int}s"
+            f"email={email_int}s, cleanup={cleanup_int}s, visibility={visibility_int}s, geo={geo_int}s, dra_canary={dra_canary_int}s, "
+            f"providers={providers_int}s"
         )
 
     async def stop(self) -> None:

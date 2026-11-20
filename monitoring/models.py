@@ -342,6 +342,50 @@ class BotCrawlEvent(Base):
         return f"<BotCrawlEvent(bot={self.bot_name}, path={self.url_path}, at={self.crawled_at})>"
 
 
+class ProviderCheck(Base):
+    """[20.11] Замер остатка поставщика данных (monitoring/providers.py): статус, остаток, на сколько прогонов хватит."""
+    __tablename__ = "provider_checks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String(50), nullable=False, index=True)       # id из providers_catalog.json
+    status = Column(String(20), nullable=False)                     # ok|low|exhausted|down|unknown
+    remaining = Column(Float, nullable=True)
+    quota_limit = Column(Float, nullable=True)                      # «limit» — служебное слово SQL
+    used = Column(Float, nullable=True)
+    runs_left = Column(Float, nullable=True)
+    resets_at = Column(String(40), nullable=True)
+    error = Column(Text, nullable=True)
+    detail = Column(JSON, nullable=True)
+    checked_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class KnowledgeEntry(Base):
+    """[20.11 · владелец «база знаний проекта в облаке»] Запись базы знаний (бывший D:\\UpgrowPlan\\INFO.md).
+    key — отпечаток «субъект + факт»: повтор той же записи не создаёт вторую строку."""
+    __tablename__ = "knowledge_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(32), nullable=False, unique=True, index=True)
+    section = Column(String(30), nullable=False, index=True)        # competitors|providers|market|search_ai|risks|opportunities|people
+    subject = Column(String(300), nullable=False)
+    fact = Column(Text, nullable=False)
+    source = Column(Text, nullable=True)
+    event_date = Column(String(10), nullable=True, index=True)      # ГГГГ-ММ-ДД — когда произошло
+    author = Column(String(50), nullable=True)                      # founder-agent | owner | monitoring
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class OwnerDigest(Base):
+    """[20.11] Утренняя сводка основателя (founder-agent) — для пункта меню мониторинга."""
+    __tablename__ = "owner_digests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    day = Column(String(10), nullable=False, unique=True, index=True)   # одна сводка на день; повтор — замена
+    text = Column(Text, nullable=False)
+    meta = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class EmailAttachment(Base):
     """Метаданные вложений"""
     __tablename__ = "email_attachments"

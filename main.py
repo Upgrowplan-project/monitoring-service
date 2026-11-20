@@ -66,7 +66,10 @@ async def _auth_dispatch(request, call_next):
         request.url.path,
         request.headers.get("authorization"),
         request.headers.get("x-ingest-token"),
-        request.headers.get("x-read-token"),
+        # [20.11 · владелец «адрес базы знаний для разработки»] ключ в ссылке (?key=) — только для чтения базы знаний
+        request.headers.get("x-read-token")
+        or (request.query_params.get("key") if request.method == "GET"
+            and request.url.path.startswith("/api/monitoring/knowledge") else None),
     )
     if verdict is not None:
         code, msg = verdict
@@ -2141,6 +2144,116 @@ async def get_ai_referrals(days: int = 30, db: Session = Depends(get_db)):
     result["events_scanned"] = len(events)
     result["events_cap_reached"] = len(events) >= 50000
     return result
+
+
+# ── [20.11 · владелец «в мониторинге, отдельный пункт меню — сводка и состояние провайдеров»] ─────────────────────────
+
+@app.get("/api/monitoring/providers")
+async def providers_state(refresh: bool = False, db: Session = Depends(get_db)):
+    """Состояние поставщиков данных: справочник + последний замер. Замер старше PROVIDERS_STALE_HOURS (сервис спит на Eco)
+    или refresh=1 — сначала новый замер (бесплатные запросы остатка, ≈5–10 с). Читают меню мониторинга, агент-сводка, позже MRS."""
+    from monitoring import providers as P
+    from monitoring.tasks import latest_provider_checks, providers_stale, providers_check_task, PROVIDERS_STALE_HOURS
+    latest = latest_provider_checks(db)
+    refreshed = None
+    if refresh or providers_stale(latest):
+        refreshed = await asyncio.get_running_loop().run_in_executor(None, providers_check_task)
+        db.expire_all()
+        latest = latest_provider_checks(db)
+    rows = P.view(latest)
+    checked = [r["checked_at"] for r in rows if r["checked_at"]]
+    return {"checked_at": max(checked) if checked else None, "stale_hours": PROVIDERS_STALE_HOURS,
+            "refreshed_now": refreshed is not None, "refresh_result": refreshed, "low_runs": P.catalog().get("low_runs"),
+            "providers": rows}
+
+
+class KnowledgeIn(BaseModel):
+    entries: List[dict]
+
+
+@app.post("/api/monitoring/knowledge")
+async def knowledge_add(body: KnowledgeIn, db: Session = Depends(get_db)):
+    """Записи базы знаний (X-Ingest-Token). Повтор «субъект + факт» и похожее на секрет — не записываются."""
+    from monitoring.knowledge import validate
+    from monitoring.models import KnowledgeEntry
+    added, skipped = [], []
+    seen = {k for (k,) in db.query(KnowledgeEntry.key).all()}
+    for e in body.entries[:200]:
+        clean, why = validate(e)
+        if not clean:
+            skipped.append({"subject": e.get("subject"), "reason": why})
+            continue
+        if clean["key"] in seen:
+            skipped.append({"subject": clean["subject"], "reason": "уже есть"})
+            continue
+        db.add(KnowledgeEntry(**clean))
+        seen.add(clean["key"])
+        added.append(clean["subject"])
+    db.commit()
+    return {"added": len(added), "skipped": skipped}
+
+
+@app.get("/api/monitoring/knowledge")
+async def knowledge_list(section: Optional[str] = None, q: Optional[str] = None, limit: int = 500,
+                         db: Session = Depends(get_db)):
+    from monitoring.knowledge import SECTIONS
+    from monitoring.models import KnowledgeEntry
+    query = db.query(KnowledgeEntry)
+    if section:
+        query = query.filter(KnowledgeEntry.section == section)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(or_(KnowledgeEntry.subject.ilike(like), KnowledgeEntry.fact.ilike(like)))
+    rows = query.order_by(KnowledgeEntry.event_date.desc(), KnowledgeEntry.id.desc()).limit(min(limit, 2000)).all()
+    return {"sections": SECTIONS, "total": len(rows), "entries": [
+        {"id": r.id, "section": r.section, "subject": r.subject, "fact": r.fact, "source": r.source,
+         "date": r.event_date, "author": r.author, "created_at": r.created_at.isoformat()} for r in rows]}
+
+
+@app.get("/api/monitoring/knowledge.md")
+async def knowledge_markdown(db: Session = Depends(get_db)):
+    """[20.11 · владелец «адрес базы знаний для целей разработки»] Вся база знаний одним Markdown-текстом по разделам —
+    для сессий разработки, WebFetch, MRS. Доступ: пароль на чтение (заголовок X-Read-Token или ?key= в ссылке)."""
+    from fastapi.responses import PlainTextResponse
+    from monitoring.knowledge import SECTIONS
+    from monitoring.models import KnowledgeEntry
+    rows = db.query(KnowledgeEntry).order_by(KnowledgeEntry.event_date.asc(), KnowledgeEntry.id.asc()).all()
+    lines = ["# База знаний Upgrowplan", "",
+             f"Записей: {len(rows)} · выгружено {datetime.utcnow():%Y-%m-%d %H:%M} UTC · ведёт founder-agent и владелец; "
+             "повторы и секреты отсекает сервер.", ""]
+    for key, title in SECTIONS.items():
+        part = [r for r in rows if r.section == key]
+        lines += [f"## {title}", ""]
+        lines += [f"- {r.event_date or r.created_at.strftime('%Y-%m-%d')} · **{r.subject}** — {r.fact}"
+                  + (f" _(источник: {r.source})_" if r.source else "") for r in part] or ["_пока пусто_"]
+        lines.append("")
+    return PlainTextResponse("\n".join(lines), media_type="text/markdown; charset=utf-8")
+
+
+class DigestIn(BaseModel):
+    day: str
+    text: str
+    meta: Optional[dict] = None
+
+
+@app.post("/api/monitoring/digests")
+async def digest_save(body: DigestIn, db: Session = Depends(get_db)):
+    """Утренняя сводка founder-agent (X-Ingest-Token); повтор за тот же день — замена."""
+    from monitoring.models import OwnerDigest
+    row = db.query(OwnerDigest).filter(OwnerDigest.day == body.day[:10]).first()
+    if row:
+        row.text, row.meta, row.created_at = body.text, body.meta, datetime.utcnow()
+    else:
+        db.add(OwnerDigest(day=body.day[:10], text=body.text, meta=body.meta))
+    db.commit()
+    return {"ok": True, "day": body.day[:10]}
+
+
+@app.get("/api/monitoring/digests")
+async def digest_list(limit: int = 14, db: Session = Depends(get_db)):
+    from monitoring.models import OwnerDigest
+    rows = db.query(OwnerDigest).order_by(OwnerDigest.day.desc()).limit(min(limit, 90)).all()
+    return {"digests": [{"day": r.day, "text": r.text, "meta": r.meta, "created_at": r.created_at.isoformat()} for r in rows]}
 
 
 if __name__ == "__main__":

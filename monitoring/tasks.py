@@ -963,3 +963,70 @@ def dra_price_canary_task(force: bool = False, post=None):
     except Exception as e:
         logger.error(f"[DRA-CANARY] failed: {type(e).__name__}: {e}")
         return {"status": "error", "message": str(e)}
+
+
+# [20.11 · владелец «состояние провайдеров — в мониторинге, MRS читает перед запуском»] Остатки поставщиков данных.
+# Каждые PROVIDERS_CHECK_INTERVAL_SECONDS (6 ч) и при чтении, если последний замер старше PROVIDERS_STALE_HOURS (6 ч):
+# мониторинг на тарифе Eco спит, поэтому замер «при чтении» — основной путь, расписание — дополнительный.
+PROVIDERS_STALE_HOURS = float(os.getenv("PROVIDERS_STALE_HOURS", "6"))
+
+
+def latest_provider_checks(db) -> dict:
+    """{provider: последний замер (dict)} — по одной строке на поставщика."""
+    from .models import ProviderCheck
+    out = {}
+    for r in db.query(ProviderCheck).order_by(ProviderCheck.checked_at.desc()).limit(500).all():
+        if r.provider not in out:
+            out[r.provider] = {"status": r.status, "remaining": r.remaining, "limit": r.quota_limit, "used": r.used,
+                               "runs_left": r.runs_left, "resets_at": r.resets_at, "error": r.error, "detail": r.detail,
+                               "checked_at": r.checked_at}
+    return out
+
+
+def providers_stale(latest: dict, now=None) -> bool:
+    checked = [m["checked_at"] for m in latest.values() if m.get("checked_at")]
+    if not checked:
+        return True
+    return ((now or datetime.utcnow()) - max(checked)).total_seconds() > PROVIDERS_STALE_HOURS * 3600
+
+
+def providers_check_task(fetch=None):
+    """Один замер всех поставщиков → provider_checks; письмо/Telegram — при смене состояния (как у сервисов)."""
+    import asyncio
+    from . import providers as P
+    from .models import ProviderCheck
+    try:
+        with get_db_session() as db:
+            prev = latest_provider_checks(db)
+        results = P.check_all(get_config(), fetch=fetch)
+        names = {p["id"]: p for p in P.catalog()["providers"]}
+        alert_manager = AlertManager()
+        to_send = []
+        with get_db_session() as db:
+            for r in results:
+                db.add(ProviderCheck(provider=r["provider"], status=r["status"], remaining=r["remaining"],
+                                     quota_limit=r["limit"], used=r["used"], runs_left=r["runs_left"],
+                                     resets_at=r["resets_at"], error=r["error"], detail=r["detail"],
+                                     checked_at=r["checked_at"]))
+                cur = P.ALERT_STATUS.get(r["status"])
+                old = P.ALERT_STATUS.get((prev.get(r["provider"]) or {}).get("status"))
+                if cur and alert_manager.should_send_alert(f"Provider {r['provider']}", cur, old):
+                    p = names[r["provider"]]
+                    if cur == "healthy":
+                        msg = f"Поставщик {p['name']} снова в порядке: остаток {r['remaining']} {p['unit']}"
+                    else:
+                        left = f", хватит примерно на {r['runs_left']} прогонов" if r["runs_left"] is not None else ""
+                        msg = (f"Поставщик {p['name']}: {r['status']} — остаток {r['remaining']} {p['unit']}{left}"
+                               + (f"; {r['error']}" if r["error"] else "") + f". Пополнить: {p['topup_url']}")
+                    alert = SystemAlert(severity=alert_manager.get_alert_severity(cur), service_name=f"Provider {p['name']}",
+                                        message=msg, created_at=datetime.utcnow())
+                    db.add(alert)
+                    to_send.append(alert)
+            db.commit()
+            for alert in to_send:
+                asyncio.run(alert_manager.send_alert(alert))
+        logger.info("[PROVIDERS] " + ", ".join(f"{r['provider']}={r['status']}" for r in results))
+        return {"status": "ok", "providers": {r["provider"]: r["status"] for r in results}, "alerts": len(to_send)}
+    except Exception as e:
+        logger.error(f"[PROVIDERS] failed: {type(e).__name__}: {e}")
+        return {"status": "error", "message": str(e)}

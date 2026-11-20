@@ -39,6 +39,8 @@ INGEST_ENDPOINTS = {
     ("POST", "/api/monitoring/reports"),
     ("POST", "/api/monitoring/synthesis-logs"),
     ("POST", "/api/monitoring/bot-crawl"),
+    ("POST", "/api/monitoring/knowledge"),   # [20.11] база знаний — пишет founder-agent
+    ("POST", "/api/monitoring/digests"),     # [20.11] утренняя сводка founder-agent
 }
 
 
@@ -60,6 +62,10 @@ READ_TOKEN_PREFIXES = (
     "/api/ratings/stats",
     "/api/ratings/timeline",
     "/api/ratings/services",
+    "/api/monitoring/providers",      # [20.11] состояние поставщиков — агент, позже MRS перед прогоном
+    "/api/monitoring/knowledge",
+    "/api/monitoring/knowledge.md",   # [20.11] вся база одним текстом — ссылка для разработки (?key=)
+    "/api/monitoring/digests",
 )
 
 

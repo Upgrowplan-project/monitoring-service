@@ -23,17 +23,20 @@ class AlertManager:
         Args:
             alert: SystemAlert объект
         """
+        # [20.11] было: «Alert sent successfully» при отказе SMTP (535) — журнал зелёный при недоставке. Теперь — по каналам.
+        # Telegram — critical и warning: «пора пополнить поставщика» (low → warning) должно дойти, не только «упал».
+        delivered = {}
         try:
-            # Email - всегда отправляем
-            await self._send_email(alert)
-            
-            # Telegram - только для critical алертов
-            if alert.severity == "critical" and self.config.TELEGRAM_BOT_TOKEN:
-                await self._send_telegram(alert)
-                
-            logger.info(f"Alert sent successfully: {alert.service_name} - {alert.message}")
+            delivered["email"] = await self._send_email(alert)
+            if alert.severity in ("critical", "warning") and self.config.TELEGRAM_BOT_TOKEN:
+                delivered["telegram"] = await self._send_telegram(alert)
         except Exception as e:
             logger.error(f"Error sending alert: {e}")
+        if any(delivered.values()):
+            logger.info(f"Alert delivered {delivered}: {alert.service_name} - {alert.message}")
+        else:
+            logger.error(f"Alert NOT delivered {delivered}: {alert.service_name} - {alert.message}")
+        return delivered
     
     async def _send_email(self, alert: SystemAlert):
         """
@@ -44,7 +47,7 @@ class AlertManager:
         """
         if not all([self.config.SMTP_HOST, self.config.SMTP_USER, self.config.SMTP_PASSWORD]):
             logger.warning("SMTP not configured, skipping email")
-            return
+            return False
         
         try:
             # Создаем сообщение
@@ -108,8 +111,10 @@ class AlertManager:
                 server.send_message(msg)
             
             logger.info(f"Email alert sent to {self.config.ADMIN_EMAIL}")
+            return True
         except Exception as e:
             logger.error(f"Error sending email: {e}")
+            return False
     
     async def _send_telegram(self, alert: SystemAlert):
         """
@@ -120,7 +125,7 @@ class AlertManager:
         """
         if not self.config.TELEGRAM_BOT_TOKEN or not self.config.TELEGRAM_CHAT_ID:
             logger.warning("Telegram not configured, skipping")
-            return
+            return False
         
         try:
             # Выбираем эмодзи в зависимости от severity
@@ -147,10 +152,12 @@ class AlertManager:
                 
                 if response.status_code == 200:
                     logger.info(f"Telegram alert sent successfully")
-                else:
-                    logger.error(f"Telegram API error: {response.status_code}")
+                    return True
+                logger.error(f"Telegram API error: {response.status_code}")
+                return False
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
+            return False
     
     async def send_notification_email(self, subject: str, html_body: str, text_body: str):
         """Отправка произвольного уведомления (не привязанного к системному алерту)"""
