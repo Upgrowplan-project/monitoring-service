@@ -408,7 +408,7 @@ async def visibility_scan_now():
 
 
 @app.get("/api/monitoring/geo")
-async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
+async def geo_results(limit: int = 300, db: Session = Depends(get_db)):
     """GEO Visibility: последние результаты проверки упоминаний бренда в нейросетях."""
     rows = (
         db.query(GeoCheck)
@@ -438,6 +438,8 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
             "position": r.position,
             "excerpt": r.excerpt,
             "auto": r.auto,
+            "cited": r.cited,                       # [21.11] ответ ссылается на upgrowplan.com
+            "sources": (r.sources or [])[:10],
             "created_at": r.created_at.isoformat(),
         }
         for r in visible_rows
@@ -455,7 +457,8 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
     # Сводка по LLM — error-записи не учитываются в проценте
     from collections import defaultdict
     summary: dict = defaultdict(lambda: {"total": 0, "mentioned": 0, "errors": 0, "last_check": None,
-                                         "brand_query_total": 0, "brand_query_mentioned": 0})
+                                         "brand_query_total": 0, "brand_query_mentioned": 0, "cited": 0,
+                                         "with_search": False})
     for r in rows:
         s = summary[r.llm]
         if is_error(r):
@@ -468,6 +471,9 @@ async def geo_results(limit: int = 100, db: Session = Depends(get_db)):
             s["total"] += 1
             if r.mentioned:
                 s["mentioned"] += 1
+        if not is_error(r) and r.cited:
+            s["cited"] += 1
+        s["with_search"] = r.llm.endswith("_search")
         if s["last_check"] is None or r.created_at.isoformat() > s["last_check"]:
             s["last_check"] = r.created_at.isoformat()
     return {"items": items, "error_items": error_items, "summary": dict(summary)}

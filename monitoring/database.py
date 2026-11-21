@@ -37,6 +37,9 @@ def init_db():
             connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS artifact_docx BYTEA"))
             connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS artifact_filename VARCHAR(512)"))
             connection.execute(text("ALTER TABLE research_reports ADD COLUMN IF NOT EXISTS artifact_mime_type VARCHAR(150)"))
+            # [21.11] GEO с поиском: источники ответа и ссылка на наш сайт
+            connection.execute(text("ALTER TABLE geo_checks ADD COLUMN IF NOT EXISTS cited BOOLEAN"))
+            connection.execute(text("ALTER TABLE geo_checks ADD COLUMN IF NOT EXISTS sources JSON"))
 
 
 def get_db() -> Session:

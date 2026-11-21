@@ -316,6 +316,9 @@ class GeoCheck(Base):
     position = Column(String(20), nullable=True)           # early|middle|late
     excerpt = Column(Text, nullable=True)
     auto = Column(Boolean, default=True, nullable=False)   # True=автоматически, False=вручную
+    # [21.11] проверки с поиском (monitoring/geo_engines.py): источники ответа и есть ли среди них upgrowplan.com
+    cited = Column(Boolean, nullable=True)
+    sources = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
     def __repr__(self):
@@ -384,6 +387,16 @@ class OwnerDigest(Base):
     text = Column(Text, nullable=False)
     meta = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class IndexNowUrl(Base):
+    """[21.11] Адрес сайта, отправленный в IndexNow, и его lastmod на момент отправки (monitoring/indexnow.py)."""
+    __tablename__ = "indexnow_urls"
+
+    url = Column(String(1024), primary_key=True)
+    lastmod = Column(String(10), nullable=True)
+    submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    status = Column(Integer, nullable=True)
 
 
 class EmailAttachment(Base):

@@ -81,6 +81,7 @@ class InProcessScheduler:
             geo_visibility_task,
             dra_price_canary_task,
             providers_check_task,
+            indexnow_task,
         )
 
         health_int = float(os.getenv("HEALTH_CHECK_INTERVAL_SECONDS", "300"))
@@ -95,6 +96,8 @@ class InProcessScheduler:
         dra_canary_int = float(os.getenv("DRA_CANARY_TICK_SECONDS", "3600"))
         # [20.11] остатки поставщиков данных; пока сервис спит — замер при чтении (/api/monitoring/providers)
         providers_int = float(os.getenv("PROVIDERS_CHECK_INTERVAL_SECONDS", str(6 * 3600)))
+        # [21.11] IndexNow — только новые/изменённые адреса карт сайта
+        indexnow_int = float(os.getenv("INDEXNOW_INTERVAL_SECONDS", str(6 * 3600)))
 
         loop = asyncio.get_running_loop()
         # Stagger initial delays so the first ticks don't all fire at once.
@@ -122,6 +125,9 @@ class InProcessScheduler:
             ),
             loop.create_task(
                 self._run_periodic("providers_check", providers_int, providers_check_task, 90)
+            ),
+            loop.create_task(
+                self._run_periodic("indexnow", indexnow_int, indexnow_task, 150)
             ),
         ]
         logger.info(

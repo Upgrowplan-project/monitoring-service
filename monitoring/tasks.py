@@ -890,6 +890,29 @@ def _geo_visibility_task_impl(force: bool = False):
         if success and i < len(queries) - 1:
             time.sleep(6)
 
+    # [21.11 · владелец «да — помоги»] те же вопросы — нейросетям С ПОИСКОМ (monitoring/geo_engines.py), отдельные ряды.
+    # Отказ по квоте/ключу/оплате (429/401/402/403) — одна запись с причиной и ряд останавливается до завтра.
+    from . import geo_engines as GE
+    for engine in GE.enabled(cfg):
+        for query in queries:
+            try:
+                ans = GE.ask(engine, query, cfg)
+                m = _extract_mention(ans["text"], brand)
+                rows.append(GeoCheck(llm=engine, query=query, response_text=ans["text"][:3000], mentioned=m["mentioned"],
+                                     position=m["position"], excerpt=m["excerpt"], auto=True,
+                                     cited=ans["cited"], sources=ans["sources"][:20]))
+                logger.info(f"[GEO] {engine} '{query[:50]}' -> mentioned={m['mentioned']} cited={ans['cited']}")
+            except GE.EngineError as e:
+                tag = "quota_exceeded" if e.kind == "quota" else e.kind
+                reason = f"[ERROR: {tag}] {GE.ENGINES[engine]['label']}: {e}"
+                rows.append(GeoCheck(llm=engine, query=query, response_text=reason, mentioned=False, position=None,
+                                     excerpt=reason, auto=True))
+                errors.append(f"{engine} '{query[:40]}': {e}")
+                logger.error(f"[GEO] {engine} '{query[:40]}': {e}")
+                if e.kind == "quota":
+                    break
+            time.sleep(2)
+
     # Считаем mentions ДО сохранения в БД — чтобы не обращаться к ORM-объектам
     # после db.commit() (expire_on_commit=True вызовет DetachedInstanceError)
     n_saved = len(rows)
@@ -1029,4 +1052,35 @@ def providers_check_task(fetch=None):
         return {"status": "ok", "providers": {r["provider"]: r["status"] for r in results}, "alerts": len(to_send)}
     except Exception as e:
         logger.error(f"[PROVIDERS] failed: {type(e).__name__}: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# [21.11 · владелец «да» на п.1] IndexNow: новые/изменённые адреса карт сайта → Bing и др. (monitoring/indexnow.py).
+def indexnow_task(get=None, post=None):
+    from . import indexnow as IN
+    from .models import IndexNowUrl
+    try:
+        current, failures = IN.fetch_sitemaps(get)
+        if not current:
+            logger.error(f"[INDEXNOW] sitemaps unreadable: {failures}")
+            return {"status": "error", "failures": failures}
+        with get_db_session() as db:
+            submitted = {r.url: (r.lastmod or "") for r in db.query(IndexNowUrl).all()}
+        todo = IN.changed(current, submitted)
+        if not todo:
+            return {"status": "ok", "submitted": 0, "known": len(submitted), "failures": failures}
+        code = IN.submit(todo, post)
+        logger.info(f"[INDEXNOW] {len(todo)} urls → HTTP {code}" + (f"; sitemap failures {failures}" if failures else ""))
+        if code in (200, 202):
+            now = datetime.utcnow()
+            with get_db_session() as db:
+                for u in todo:
+                    row = db.get(IndexNowUrl, u) or IndexNowUrl(url=u)
+                    row.lastmod, row.submitted_at, row.status = current[u], now, code
+                    db.merge(row)
+                db.commit()
+            return {"status": "ok", "submitted": len(todo), "http": code, "failures": failures}
+        return {"status": "error", "submitted": 0, "http": code, "pending": len(todo)}
+    except Exception as e:
+        logger.error(f"[INDEXNOW] failed: {type(e).__name__}: {e}")
         return {"status": "error", "message": str(e)}
