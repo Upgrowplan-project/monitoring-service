@@ -1027,6 +1027,9 @@ def providers_check_task(fetch=None):
         to_send = []
         with get_db_session() as db:
             for r in results:
+                # [24.11] страница остатка недоступна вторую проверку подряд → unavailable_long (одно предупреждение)
+                if r["status"] == "unavailable" and (prev.get(r["provider"]) or {}).get("status") in ("unavailable", "unavailable_long"):
+                    r["status"] = "unavailable_long"
                 db.add(ProviderCheck(provider=r["provider"], status=r["status"], remaining=r["remaining"],
                                      quota_limit=r["limit"], used=r["used"], runs_left=r["runs_left"],
                                      resets_at=r["resets_at"], error=r["error"], detail=r["detail"],
@@ -1037,6 +1040,9 @@ def providers_check_task(fetch=None):
                     p = names[r["provider"]]
                     if cur == "healthy":
                         msg = f"Поставщик {p['name']} снова в порядке: остаток {r['remaining']} {p['unit']}"
+                    elif r["status"] == "unavailable_long":
+                        msg = (f"Поставщик {p['name']}: страница остатка не отвечает вторую проверку подряд ({r['error']}). "
+                               f"Проверить кабинет: {p['topup_url']}")
                     else:
                         left = f", хватит примерно на {r['runs_left']} прогонов" if r["runs_left"] is not None else ""
                         msg = (f"Поставщик {p['name']}: {r['status']} — остаток {r['remaining']} {p['unit']}{left}"

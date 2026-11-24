@@ -7,19 +7,32 @@
   low       — хватит меньше чем на low_runs прогонов (справочник, 5) или денег меньше low_below;
   ok        — иначе;
   unknown   — нет ключа или у поставщика нет способа узнать остаток (CSE, Exa, OpenAI — пока по журналу/вручную).
+  [24.11 · владелец «да» · ложная тревога CRITICAL 17:39 UTC: страница остатка Tavily ответила 503 «Usage data is temporarily
+  unavailable», а поиск работал — проверено руками 17:44: usage 200, search 200]
+  unavailable      — страница остатка временно не отвечает (5xx / 429) и после повтора через RETRY_PAUSE_S — без тревоги;
+  unavailable_long — то же вторую проверку подряд — одно предупреждение (warning), без повторов; отказ ключа / оплаты — down.
 Расход на прогон — из справочника providers_catalog.json (одно место), не из этого кода.
 Запросы остатка у Tavily, SerpApi, DataForSEO, Apify бесплатны (живой образец ответов снят 20.11)."""
 from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 CATALOG_PATH = Path(__file__).resolve().parent / "providers_catalog.json"
-# ok/low/exhausted/down → словарь AlertManager (healthy/degraded/down); unknown — без тревог
-ALERT_STATUS = {"ok": "healthy", "low": "degraded", "exhausted": "down", "down": "down"}
+# ok/low/exhausted/down → словарь AlertManager (healthy/degraded/down); unknown / unavailable — без тревог;
+# unavailable_long — degraded (одно предупреждение при переходе, восстановление — сообщение «снова в порядке»)
+ALERT_STATUS = {"ok": "healthy", "low": "degraded", "exhausted": "down", "down": "down", "unavailable_long": "degraded"}
+RETRY_PAUSE_S = float(os.getenv("PROVIDER_RETRY_SECONDS", "20"))
+TEMP_PREFIX = "остаток временно недоступен"
+
+
+def temporary_failure(code: Optional[int]) -> bool:
+    """Страница остатка временно не отвечает: ошибка сервера или «слишком часто». Отказ ключа (401 / 403) и оплаты (402) — не временно."""
+    return code is not None and (code >= 500 or code == 429)
 
 Fetch = Callable[[str, str, Dict[str, Any]], Tuple[Optional[int], Any]]   # (method, url, kwargs) → (status, json)
 
@@ -114,8 +127,8 @@ def _http_fetch(method: str, url: str, kwargs: Dict[str, Any]) -> Tuple[Optional
         return r.status_code, r.text[:300]
 
 
-def check_all(config=None, fetch: Optional[Fetch] = None) -> List[Dict[str, Any]]:
-    """Один проход по справочнику → список результатов (без записи в базу). fetch — подмена для гейта."""
+def check_all(config=None, fetch: Optional[Fetch] = None, sleep: Callable[[float], None] = time.sleep) -> List[Dict[str, Any]]:
+    """Один проход по справочнику → список результатов (без записи в базу). fetch, sleep — подмена для гейта."""
     cat = catalog()
     low_runs = int(cat.get("low_runs") or 5)
     reqs = _requests(config)
@@ -136,7 +149,17 @@ def check_all(config=None, fetch: Optional[Fetch] = None) -> List[Dict[str, Any]
                 code, body = fetch(method, url, kw)
             except Exception as e:
                 code, body = None, f"{type(e).__name__}: {str(e)[:160]}"
-            if code != 200 or not isinstance(body, dict):
+            if temporary_failure(code):                       # [24.11] временный сбой страницы остатка — один повтор
+                sleep(RETRY_PAUSE_S)
+                try:
+                    code, body = fetch(method, url, kw)
+                except Exception as e:
+                    code, body = None, f"{type(e).__name__}: {str(e)[:160]}"
+            if temporary_failure(code):
+                res["status"] = "unavailable"
+                res["error"] = (f"{TEMP_PREFIX}: HTTP {code} {str(body)[:160]} (повтор через {RETRY_PAUSE_S:g} с — то же); "
+                                "сам поиск не проверялся")
+            elif code != 200 or not isinstance(body, dict):
                 res["status"] = "down"
                 res["error"] = f"HTTP {code}: {str(body)[:200]}" if code else f"нет ответа: {body}"
             else:

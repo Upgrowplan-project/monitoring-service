@@ -122,6 +122,57 @@ def test_task_stores_and_alerts_only_on_change(monkeypatch):
     db.close()
 
 
+def test_usage_page_temporary_failure_is_not_down(monkeypatch):
+    """[24.11 · ложная тревога CRITICAL 17:39 UTC] страница остатка Tavily 503 «Usage data is temporarily unavailable», поиск работал:
+    503 → повтор → 200 = ok; 503 дважды = unavailable без тревоги; вторая проверка подряд — одно предупреждение; восстановление —
+    «снова в порядке»; отказ ключа 401 — по-прежнему down."""
+    from monitoring import tasks
+    from monitoring.alerting import AlertManager
+    from monitoring.database import Base, SessionLocal, engine
+    from monitoring.models import ProviderCheck, SystemAlert
+    monkeypatch.setattr(P, "RETRY_PAUSE_S", 0)
+    busy = (503, {"detail": {"error": "Usage data is temporarily unavailable. Please try again later."}})
+
+    def seq(tavily_answers):
+        it = iter(tavily_answers)
+        base = fake(OK_ANSWERS)
+
+        def f(method, url, kw):
+            if "tavily" in url:
+                return next(it)
+            return base(method, url, kw)
+        return f
+    r = {x["provider"]: x for x in P.check_all(Cfg, fetch=seq([busy, OK_ANSWERS["tavily"]]))}
+    assert r["tavily"]["status"] == "ok"
+    r = {x["provider"]: x for x in P.check_all(Cfg, fetch=seq([busy, busy]))}
+    assert r["tavily"]["status"] == "unavailable" and P.TEMP_PREFIX in r["tavily"]["error"]
+    r = {x["provider"]: x for x in P.check_all(Cfg, fetch=seq([(401, {"error": "Invalid API key"}), OK_ANSWERS["tavily"]]))}
+    assert r["tavily"]["status"] == "down"                                   # отказ ключа — без повтора, тревога
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    db.query(ProviderCheck).delete()
+    db.query(SystemAlert).filter(SystemAlert.service_name.like("Provider %")).delete(synchronize_session=False)
+    db.commit()
+    db.close()
+    sent = []
+
+    async def capture(self, alert):
+        sent.append((alert.severity, alert.message))
+    monkeypatch.setattr(AlertManager, "send_alert", capture)
+    monkeypatch.setattr(tasks, "get_config", lambda: Cfg)
+    tasks.providers_check_task(fetch=seq([OK_ANSWERS["tavily"]]))
+    n0 = len(sent)
+    a1 = tasks.providers_check_task(fetch=seq([busy, busy]))
+    a2 = tasks.providers_check_task(fetch=seq([busy, busy]))
+    a3 = tasks.providers_check_task(fetch=seq([busy, busy]))
+    a4 = tasks.providers_check_task(fetch=seq([OK_ANSWERS["tavily"]]))
+    tav = [m for _, m in sent[n0:] if "Tavily" in m]
+    assert a1["providers"]["tavily"] == "unavailable" and a2["providers"]["tavily"] == "unavailable_long"
+    assert a3["providers"]["tavily"] == "unavailable_long" and a4["providers"]["tavily"] == "ok"
+    assert len(tav) == 2 and "вторую проверку подряд" in tav[0] and "снова в порядке" in tav[1]
+    assert not any(sev == "critical" for sev, m in sent[n0:] if "Tavily" in m)
+
+
 def test_knowledge_rules():
     a, _ = K.validate({"section": "providers", "subject": "Tavily", "fact": "Использовано 80% лимита."})
     b, _ = K.validate({"section": "providers", "subject": "tavily", "fact": "использовано 80 % лимита!"})
