@@ -71,12 +71,48 @@ def evaluate(status_code: Optional[int], body: Any, error: str = "") -> Dict[str
             "metadata": meta}
 
 
-def run(base_url: Optional[str], post: Optional[Callable[[str, Dict[str, Any], float], Any]] = None) -> Dict[str, Any]:
-    """Один вызов DRA (3 страницы) → результат evaluate + секунды. post(url, json, timeout) → (status_code, body) — подмена для гейта."""
+WAKE_BUDGET_S = float(os.getenv("DRA_CANARY_WAKE_SECONDS", "90"))
+WAKE_PAUSE_S = 5.0
+
+
+def wake(base_url: str, get: Optional[Callable[[str, float], Any]] = None, budget_s: float = WAKE_BUDGET_S,
+         sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
+    """[24.11 · владелец «1» · ложная тревога 24.11 00:52 UTC] DRA на Heroku Eco засыпает: первый запрос к спящему дино ждёт запуск
+    ~30 с и обрывается роутером (H99 → «DRA ответил HTTP 503»), через 2 с DRA уже работает (журнал DRA 00:51:52 Unidling → 00:52:24
+    up; повтор руками 24.11: 503 за 31 с, затем 200). Перед проверкой цен — GET /health до 200, не дольше budget_s.
+    get(url, timeout) → status_code — подмена для тестов. → {ok, attempts, seconds, last}."""
+    t0, attempts, last = time.monotonic(), 0, None
+    while True:
+        attempts += 1
+        try:
+            if get is not None:
+                last = get(f"{base_url}/health", 60.0)
+            else:
+                import httpx
+                last = httpx.get(f"{base_url}/health", timeout=60.0).status_code
+        except Exception as e:
+            last = f"{type(e).__name__}"
+        if last == 200:
+            return {"ok": True, "attempts": attempts, "seconds": round(time.monotonic() - t0, 1), "last": last}
+        if time.monotonic() - t0 + WAKE_PAUSE_S > budget_s:
+            return {"ok": False, "attempts": attempts, "seconds": round(time.monotonic() - t0, 1), "last": last}
+        sleep(WAKE_PAUSE_S)
+
+
+def run(base_url: Optional[str], post: Optional[Callable[[str, Dict[str, Any], float], Any]] = None,
+        get: Optional[Callable[[str, float], Any]] = None) -> Dict[str, Any]:
+    """Один вызов DRA (3 страницы) → результат evaluate + секунды. post(url, json, timeout) → (status_code, body) — подмена для гейта.
+    Перед вызовом — пробуждение DRA (wake) при настоящем запросе или при подмене get; DRA не проснулся — «down» с причиной."""
     t0 = time.monotonic()
     if not base_url:
         return {"status": "down", "error_message": "адрес DRA не задан (DRA_CANARY_URL / MONITORED_SERVICES)",
                 "metadata": {"pages": [], "priced": 0, "total_facts": 0, "expected": len(PAGES)}, "seconds": 0.0}
+    w = wake(base_url, get=get) if (post is None or get is not None) else None
+    if w is not None and not w["ok"]:
+        return {"status": "down", "error_message": f"DRA не проснулся за {int(WAKE_BUDGET_S)} с: /health → {w['last']} "
+                                                   f"({w['attempts']} попыток)",
+                "metadata": {"pages": [], "priced": 0, "total_facts": 0, "expected": len(PAGES), "wake": w},
+                "seconds": round(time.monotonic() - t0, 1)}
     payload = {"urls": PAGES, "product": PRODUCT, "location": LOCATION}
     code, body, err = None, None, ""
     try:
@@ -95,4 +131,6 @@ def run(base_url: Optional[str], post: Optional[Callable[[str, Dict[str, Any], f
     res = evaluate(code, body, err)
     res["seconds"] = round(time.monotonic() - t0, 1)
     res["metadata"]["seconds"] = res["seconds"]
+    if w is not None:
+        res["metadata"]["wake"] = w
     return res

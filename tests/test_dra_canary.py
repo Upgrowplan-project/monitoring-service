@@ -47,6 +47,24 @@ def test_run_posts_the_same_call_as_mrs():
     assert DC.run(None)["status"] == "down"
 
 
+def test_wake_sleeping_dra_before_the_check(monkeypatch):
+    """[24.11 · ложная тревога 00:52 UTC] спящий Eco-DRA: первый /health — 503, затем 200 → проверка цен идёт и «healthy»;
+    DRA не проснулся за бюджет → «down» с причиной «не проснулся», запрос цен не отправлен."""
+    monkeypatch.setattr(DC.time, "sleep", lambda s: None)
+    codes, asked = [503, 200], []
+    r = DC.run("https://dra.example", post=lambda u, p, t: (asked.append(u), (200, _body([3, 4, 5])))[1],
+               get=lambda u, t: codes.pop(0))
+    assert r["status"] == "healthy" and r["metadata"]["wake"]["attempts"] == 2 and asked == ["https://dra.example/api/extract_prices"]
+    asked.clear()
+    clock = iter(range(0, 10_000, 3))                      # часы идут: каждый вызов +3 с (пауза подменена)
+    monkeypatch.setattr(DC.time, "monotonic", lambda: next(clock))
+    w = DC.wake("https://dra.example", get=lambda u, t: 503, budget_s=12, sleep=lambda s: None)
+    assert w["ok"] is False and w["attempts"] >= 2 and w["last"] == 503
+    monkeypatch.setattr(DC, "WAKE_BUDGET_S", 12)
+    r2 = DC.run("https://dra.example", post=lambda u, p, t: (asked.append(u), (200, _body([3, 4, 5])))[1], get=lambda u, t: 503)
+    assert r2["status"] == "down" and "не проснулся" in r2["error_message"] and asked == []
+
+
 def test_base_url_from_monitored_services(monkeypatch):
     monkeypatch.delenv("DRA_CANARY_URL", raising=False)
 
