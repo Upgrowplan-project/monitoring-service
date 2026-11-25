@@ -1550,32 +1550,7 @@ async def ingest_pageview(payload: dict, request: Request, db: Session = Depends
             or None
         )
         ua = request.headers.get("user-agent", "")
-        ua_info = _parse_user_agent(ua)
-
-        def _clip(v, n):
-            return v[:n] if isinstance(v, str) else v
-
-        row = WebEvent(
-            event_type=(payload.get("event_type") or "pageview")[:50],
-            event_name=_clip(payload.get("event_name"), 120),
-            path=_clip(sanitize_analytics_path(payload.get("path")), 1024),
-            referrer=_clip(sanitize_analytics_url(payload.get("referrer")), 1024),
-            utm_source=_clip(payload.get("utm_source"), 255),
-            utm_medium=_clip(payload.get("utm_medium"), 255),
-            utm_campaign=_clip(payload.get("utm_campaign"), 255),
-            visitor_id=_clip(payload.get("visitor_id"), 64),
-            session_id=_clip(payload.get("session_id"), 64),
-            device_type=ua_info["device_type"],
-            browser=ua_info["browser"],
-            os=ua_info["os"],
-            locale=_clip(payload.get("locale"), 20),
-            timezone=_clip(payload.get("timezone"), 64),
-            country=_clip(country, 8),
-            ip_hash=_hash_ip(client_ip),
-            user_agent=_clip(ua, 1000),
-            locale_url=_clip(sanitize_analytics_url(payload.get("url")), 1024),
-        )
-        db.add(row)
+        db.add(_web_event_row(payload, ua, _hash_ip(client_ip), country))
         db.commit()
         return {"ok": True}
     except Exception as e:
@@ -1583,6 +1558,85 @@ async def ingest_pageview(payload: dict, request: Request, db: Session = Depends
         logger.error(f"Error ingesting pageview: {e}")
         # Beacon должен быть «тихим» — не отдаём 500, чтобы не плодить ошибки в консоли клиента.
         return {"ok": False}
+
+
+def _web_event_row(payload: dict, ua: str, ip_hash: Optional[str], country: Optional[str],
+                   created_at: Optional[datetime] = None) -> WebEvent:
+    """Одна строка просмотра — общая для одиночного beacon и пачки с сайта (одни правила обрезки и очистки адресов)."""
+    def _clip(v, n):
+        return v[:n] if isinstance(v, str) else v
+
+    ua_info = _parse_user_agent(ua or "")
+    row = WebEvent(
+        event_type=(payload.get("event_type") or "pageview")[:50],
+        event_name=_clip(payload.get("event_name"), 120),
+        path=_clip(sanitize_analytics_path(payload.get("path")), 1024),
+        referrer=_clip(sanitize_analytics_url(payload.get("referrer")), 1024),
+        utm_source=_clip(payload.get("utm_source"), 255),
+        utm_medium=_clip(payload.get("utm_medium"), 255),
+        utm_campaign=_clip(payload.get("utm_campaign"), 255),
+        visitor_id=_clip(payload.get("visitor_id"), 64),
+        session_id=_clip(payload.get("session_id"), 64),
+        device_type=ua_info["device_type"],
+        browser=ua_info["browser"],
+        os=ua_info["os"],
+        locale=_clip(payload.get("locale"), 20),
+        timezone=_clip(payload.get("timezone"), 64),
+        country=_clip(country, 8),
+        ip_hash=_clip(ip_hash, 64),
+        user_agent=_clip(ua, 1000),
+        locale_url=_clip(sanitize_analytics_url(payload.get("url")), 1024),
+    )
+    if created_at is not None:
+        row.created_at = created_at
+    return row
+
+
+# [25.11 · владелец «давай (а)»] Сайт копит просмотры и заходы ИИ-роботов у себя (Upstash Redis) и раз в сутки шлёт их
+# сюда одной пачкой — мониторинг на Eco-дино больше не будится каждым просмотром (7 из 14 пробуждений за 33.7 ч 24–25.11).
+# Страна, браузер и отпечаток IP считаются на сайте при приёме просмотра (той же формулой _hash_ip), время — настоящее время
+# события. Ошибка записи → 500 и ничего не записано: сайт оставит пачку у себя и повторит в следующие сутки.
+EVENTS_BATCH_MAX = 5000
+
+
+@app.post("/api/monitoring/events-batch")
+async def ingest_events_batch(payload: dict, db: Session = Depends(get_db)):
+    """Тело: { pageviews: [{...поля beacon..., user_agent, ip_hash, country, created_at}],
+               bot_crawls: [{bot_name, bot_raw_ua?, url_path, crawled_at}] }. Требует X-Ingest-Token."""
+    pageviews = payload.get("pageviews") or []
+    bot_crawls = payload.get("bot_crawls") or []
+    if not isinstance(pageviews, list) or not isinstance(bot_crawls, list):
+        raise HTTPException(status_code=400, detail="pageviews and bot_crawls must be lists")
+    if len(pageviews) + len(bot_crawls) > EVENTS_BATCH_MAX:
+        raise HTTPException(status_code=413, detail=f"batch over {EVENTS_BATCH_MAX} events")
+    now = datetime.utcnow()
+    saved_pv = saved_bot = skipped = 0
+    try:
+        for ev in pageviews:
+            if not isinstance(ev, dict) or not ev.get("path"):
+                skipped += 1
+                continue
+            at = _parse_iso(ev.get("created_at"))
+            db.add(_web_event_row(ev, ev.get("user_agent") or "", ev.get("ip_hash"), ev.get("country"),
+                                  min(at, now) if at else now))
+            saved_pv += 1
+        for ev in bot_crawls:
+            name = (ev.get("bot_name") or "").strip() if isinstance(ev, dict) else ""
+            path = (ev.get("url_path") or "").strip() if isinstance(ev, dict) else ""
+            if not name or not path:
+                skipped += 1
+                continue
+            at = _parse_iso(ev.get("crawled_at"))
+            db.add(BotCrawlEvent(bot_name=name[:100], bot_raw_ua=ev.get("bot_raw_ua"), url_path=path[:1024],
+                                 crawled_at=min(at, now) if at else now))
+            saved_bot += 1
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"events-batch ingest error: {e}")
+        raise HTTPException(status_code=500, detail="events batch not saved")
+    logger.info(f"[EVENTS-BATCH] pageviews {saved_pv}, bot_crawls {saved_bot}, skipped {skipped}")
+    return {"ok": True, "pageviews": saved_pv, "bot_crawls": saved_bot, "skipped": skipped}
 
 
 @app.get("/api/monitoring/analytics")

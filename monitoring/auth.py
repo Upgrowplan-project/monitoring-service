@@ -39,6 +39,7 @@ INGEST_ENDPOINTS = {
     ("POST", "/api/monitoring/reports"),
     ("POST", "/api/monitoring/synthesis-logs"),
     ("POST", "/api/monitoring/bot-crawl"),
+    ("POST", "/api/monitoring/events-batch"),  # [25.11] пачка просмотров и заходов роботов с сайта раз в сутки
     ("POST", "/api/monitoring/knowledge"),   # [20.11] база знаний — пишет founder-agent
     ("POST", "/api/monitoring/digests"),     # [20.11] утренняя сводка founder-agent
 }
