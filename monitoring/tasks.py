@@ -29,15 +29,34 @@ celery_app.conf.update(
 )
 
 
+HEALTH_CHECK_INTERVAL_SECONDS = float(os.getenv("HEALTH_CHECK_INTERVAL_SECONDS", "300"))
+
+
+def health_check_due(last_checked, now=None, interval: float = None) -> bool:
+    """[28.11 · владелец «2 да»] Чистая функция (гейт): пора ли проверять сервисы. Раньше проверка шла через 5 с после
+    КАЖДОГО старта мониторинга (интервал 86400 считался от старта, а Eco стартует много раз в сутки) — и будила соседей.
+    Теперь — по журналу ServiceHealth: последняя проверка старше интервала (или её нет)."""
+    now = now or datetime.utcnow()
+    interval = HEALTH_CHECK_INTERVAL_SECONDS if interval is None else interval
+    return last_checked is None or (now - last_checked).total_seconds() >= interval
+
+
 @celery_app.task(name='monitoring.check_all_services')
-def check_all_services_task():
+def check_all_services_task(force: bool = False):
     """
-    Периодическая проверка всех сервисов
-    Запускается каждые 5 минут
+    Периодическая проверка всех сервисов — не чаще HEALTH_CHECK_INTERVAL_SECONDS по журналу (см. health_check_due);
+    force=True — вне расписания.
     """
     import asyncio
-    
+
     try:
+        if not force:
+            with get_db_session() as db:
+                last = db.query(ServiceHealth).filter(ServiceHealth.service_type == "service") \
+                    .order_by(ServiceHealth.last_checked.desc()).first()
+                last_checked = last.last_checked if last else None
+            if not health_check_due(last_checked):
+                return {"status": "skipped", "reason": "checked recently", "last_checked": str(last_checked)}
         logger.info("Starting service health checks...")
         
         # Запускаем async функцию

@@ -84,7 +84,9 @@ class InProcessScheduler:
             indexnow_task,
         )
 
-        health_int = float(os.getenv("HEALTH_CHECK_INTERVAL_SECONDS", "300"))
+        # [28.11] задача сама решает по журналу, пора ли (tasks.health_check_due); планировщик лишь будит её не реже раза в час,
+        # чтобы суточный интервал наступал, даже когда Eco-процесс бодрствует урывками
+        health_int = min(float(os.getenv("HEALTH_CHECK_INTERVAL_SECONDS", "300")), 3600.0)
         redis_int = float(os.getenv("REDIS_CHECK_INTERVAL_SECONDS", "120"))
         email_int = float(getattr(config, "IMAP_POLL_INTERVAL_SECONDS", 60) or 60)
         cleanup_int = float(os.getenv("CLEANUP_INTERVAL_SECONDS", str(24 * 3600)))

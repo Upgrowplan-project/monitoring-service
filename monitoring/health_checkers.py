@@ -1,7 +1,7 @@
 import httpx
 import asyncio
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -278,6 +278,60 @@ class HealthChecker:
                 "error_message": str(e)
             }
     
+    @staticmethod
+    async def heroku_web_dynos(api_key: str, app_name: str) -> List[Dict[str, Any]]:
+        """Web-процессы приложения из Heroku Platform API (state: up / idle / starting / crashed / down; size: Eco / Basic …).
+        Запрос идёт в api.heroku.com, а не в само приложение, — спящий процесс он не будит. Ошибка API — исключение."""
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"https://api.heroku.com/apps/{app_name}/dynos",
+                headers={"Authorization": f"Bearer {api_key}", "Accept": "application/vnd.heroku+json; version=3"},
+            )
+        if r.status_code != 200:
+            raise RuntimeError(f"Heroku API HTTP {r.status_code}")
+        return [d for d in (r.json() or []) if d.get("type") == "web"]
+
+    @staticmethod
+    async def check_service_without_waking(
+        name: str,
+        url: str,
+        health_path: str,
+        heroku_app: str,
+        heroku_api_key: str,
+        up_on_any_response: bool = False,
+        wake_retry_delay: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        [28.11 · владелец «2 да»] Журналы Heroku 25–27.11: 7 из 12 пробуждений сервиса пользователей — через ~10 с после
+        пробуждения мониторинга, первым запросом GET / (проверка здоровья при старте). Каждое пробуждение Eco — ≥ 30 мин
+        из общей квоты часов. Поэтому состояние сначала спрашиваем у Heroku:
+        - нет web-процессов / процесс упал → down (по адресу не ходим);
+        - тариф Eco: спит (idle) или работает → healthy без запроса к сервису (запрос будит спящего и продлевает
+          бодрствующему ещё 30 мин);
+        - другой тариф (Basic и выше не засыпают) → обычная проверка по адресу.
+        Heroku API не ответил → degraded с причиной; по адресу не ходим (иначе разбудим).
+        """
+        try:
+            dynos = await HealthChecker.heroku_web_dynos(heroku_api_key, heroku_app)
+        except Exception as e:
+            return {"status": "degraded", "error_message": f"Heroku API: {e}",
+                    "metadata": {"checked_via": "heroku_api", "heroku_app": heroku_app}}
+        states = [d.get("state") for d in dynos]
+        sizes = [str(d.get("size") or "") for d in dynos]
+        meta = {"checked_via": "heroku_api", "heroku_app": heroku_app, "dyno_states": states, "dyno_sizes": sizes}
+        if not dynos:
+            return {"status": "down", "error_message": "no web dynos", "metadata": meta}
+        bad = [s for s in states if s not in ("up", "idle", "starting")]
+        if bad:
+            return {"status": "down", "error_message": f"dyno state: {', '.join(bad)}", "metadata": meta}
+        if all(s.lower() == "eco" for s in sizes):
+            meta["sleeping"] = all(s == "idle" for s in states)
+            return {"status": "healthy", "response_time": None, "metadata": meta}
+        result = await HealthChecker.check_http_service(
+            name, url, health_path, up_on_any_response=up_on_any_response, wake_retry_delay=wake_retry_delay)
+        result.setdefault("metadata", {}).update(meta)
+        return result
+
     @staticmethod
     async def check_http_service(
         name: str,
@@ -580,14 +634,22 @@ async def check_all_services(config, wake_retry_delay: float = 10.0) -> list:
             continue
         svc_name = svc.get("name") or svc.get("url")
         _liveness = str(svc.get("liveness", "")).lower() == "any" or bool(svc.get("up_on_any_response"))
-        tasks.append({
-            "coro": checker.check_http_service(
+        # [28.11] "heroku_app" в записи + HEROKU_API_KEY → состояние у Heroku, спящий Eco не будим (check_service_without_waking)
+        if svc.get("heroku_app") and config.HEROKU_API_KEY:
+            coro = checker.check_service_without_waking(
+                svc_name, svc["url"], svc.get("health_path", "/health"), svc["heroku_app"], config.HEROKU_API_KEY,
+                up_on_any_response=_liveness, wake_retry_delay=wake_retry_delay,
+            )
+        else:
+            coro = checker.check_http_service(
                 svc_name,
                 svc["url"],
                 svc.get("health_path", "/health"),
                 up_on_any_response=_liveness,
                 wake_retry_delay=wake_retry_delay,
-            ),
+            )
+        tasks.append({
+            "coro": coro,
             "service_name": svc_name,
             "service_type": "service",
         })
